@@ -159,8 +159,10 @@ terminate(_Reason, _State) ->
 
 handle_info(timeout, State) ->
     erlang:send_after(?TIMEOUT, self(), timeout),
-    {noreply, do_check_update(State)};
-
+    case catch do_check_update(State) of
+        {'EXIT', _} -> {noreply, State};
+        NState -> {noreply, NState}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
