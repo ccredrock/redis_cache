@@ -158,11 +158,9 @@ terminate(_Reason, _State) ->
     ok.
 
 handle_info(timeout, State) ->
-    case {catch do_check_update(State),
-          erlang:send_after(?TIMEOUT, self(), timeout)} of
-        {{'EXIT', _}, _} -> {noreply, State};
-        {NState, _} -> {noreply, NState}
-    end;
+    State1 = do_timeout(State),
+    erlang:send_after(?TIMEOUT, self(), timeout),
+    {noreply, State1};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -262,6 +260,12 @@ do_get_map(Name, Key, MKV) ->
     end.
 
 %%------------------------------------------------------------------------------
+do_timeout(State) ->
+    case catch do_check_update(State) of
+        #state{} = NState -> NState;
+        {'EXIT', Reason} -> error_logger:error_msg("redis_cache error ~p~n", [{Reason}])
+    end.
+
 do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen} = State) ->
     case eredis_pool:q([<<"LLEN">>, ?NOTICE]) of
         {ok, NBinLen} ->
