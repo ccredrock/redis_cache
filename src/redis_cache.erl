@@ -242,7 +242,7 @@ do_form_del(Table, Key) ->
 
 do_set_ets([{put_val, Table, Key, MKV} | T]) ->
     EtsTable = ?ETS_TABLE(Table),
-    ets:insert(EtsTable, {Key, do_get_map(EtsTable, Key, MKV)}),
+    ets:insert(EtsTable, {to_binary(Key), do_get_map(EtsTable, Key, MKV)}),
     do_set_ets(T);
 do_set_ets([{del_val, Table, Key} | T]) ->
     ets:delete(?ETS_TABLE(Table), Key),
@@ -304,5 +304,5 @@ do_update_key(Val) ->
 do_parse_redis_table(RedisTable) ->
     [<<>>, TK] = binary:split(RedisTable, ?REDIS_TABLE(<<>>)),
     [Table, EtsKey] = re:split(TK, <<"@">>),
-    {Table, put_type(EtsKey, atom)}.
+    {Table, EtsKey}.
 
