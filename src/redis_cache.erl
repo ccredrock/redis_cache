@@ -44,8 +44,8 @@
 
 -define(BIN(V), to_binary(V)).
 
--define(REDIS_TABLE(L), iolist_to_binary([<<"$redis_cache_kv_">> | L])).
--define(ETS_TABLE(L), list_to_atom("$redis_cache_kv_" ++ atom_to_list(L))).
+-define(REDIS_TABLE(L), iolist_to_binary([<<"$redis_cache_kv#">> | L])).
+-define(ETS_TABLE(L), list_to_atom("$redis_cache_kv#" ++ atom_to_list(L))).
 
 -define(NOTICE, <<"$redis_cache_notice">>).
 
@@ -94,11 +94,7 @@ get_val(Table, Key) ->
 get_val(Table, Key, CKey) ->
     case get_val(Table, Key) of
         null -> null;
-        Map ->
-            case maps:find(CKey, Map) of
-                {ok, Val} -> Val;
-                error -> null
-            end
+        Map -> maps:get(CKey, Map, null)
     end.
 
 reload() -> reload('$all').
@@ -126,7 +122,7 @@ get_table_vals(Table) ->
 get_redis_vals(Table) ->
     {ok, KeyList} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), <<"*">>])]),
     [begin
-         {ok, Vals} = eredis_pool:q([<<"HGETALL">>, ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)])]),
+         {ok, Vals} = eredis_pool:q([<<"HGETALL">>, ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)])]),
          {Key, Vals}
      end || Key <- KeyList].
 
@@ -235,14 +231,14 @@ do_form_put(Table, Key, [{CK, CV} | T], Acc) ->
     do_form_put(Table, Key, T, [encode(CK), encode(CV)| Acc]);
 do_form_put(_Table, _Key, [], []) -> [];
 do_form_put(Table, Key, [], Acc) ->
-    Key1 = ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)]),
+    Key1 = ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)]),
     [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => Key1})],
      [<<"HMSET">>, Key1] ++ Acc].
 
 do_form_del(Table, Key) ->
-    Key1 = ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)]),
+    Key1 = ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)]),
     [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => Key1})],
-     [<<"DEL">>, ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)])]].
+     [<<"DEL">>, ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)])]].
 
 do_set_ets([{put_val, Table, Key, MKV} | T]) ->
     EtsTable = ?ETS_TABLE(Table),
@@ -307,6 +303,6 @@ do_update_key(Val) ->
 
 do_parse_redis_table(RedisTable) ->
     [<<>>, TK] = binary:split(RedisTable, ?REDIS_TABLE(<<>>)),
-    [Table, EtsKey] = re:split(TK, <<"_">>),
+    [Table, EtsKey] = re:split(TK, <<"@">>),
     {Table, put_type(EtsKey, atom)}.
 
