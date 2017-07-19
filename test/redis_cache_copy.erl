@@ -12,24 +12,27 @@
 
 -export([start_link/1]).
 
--export([put_val/1,
-         put_val/3,
-         put_val/4,
-         del_val/1,
-         del_val/2,
-         set_val/1,
-         get_val/2,
-         get_val/3]).
+-export([put_val/1,     %% 更新
+         put_val/3,     %% 更新
+         put_val/4,     %% 更新
+         del_val/1,     %% 删除
+         del_val/2,     %% 删除
+         set_val/1,     %% 更新 || 删除
+         get_val/2,     %% 获取
+         get_val/3]).   %% 获取
 
--export([purge/0,
-         clean/0,
-         clean/1,
-         reload/0,
-         reload/1,
-         get_redis_notice_len/0,
+-export([purge/0,       %% 净化系统
+         clean/0,       %% 清理数据
+         clean/1,       %% 清理数据
+         reload/0,      %% 重新加载
+         reload/1]).    %% 重新加载
+
+-export([get_redis_notice_len/0,
          get_cache_notice_len/0,
          get_table_vals/1,
          get_redis_vals/1]).
+
+-export([lock/0, get_locks/0]).
 
 %% callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -40,12 +43,12 @@
 
 -define(TIMEOUT, 500).
 
--record(state, {tables = [], notice_len = 0, reduce_max = 0, reduce_len = 0}).
+-record(state, {tables = [], notice_len = 0, reduce_max = 0, reduce_len = 0, locks = []}).
 
 -define(BIN(V), to_binary(V)).
 
--define(REDIS_TABLE(L), iolist_to_binary([<<"$redis_cache_kv_">> | L])).
--define(ETS_TABLE(L), list_to_atom("$redis_cache_copy_kv_" ++ atom_to_list(L))).
+-define(REDIS_TABLE(L), iolist_to_binary([<<"$redis_cache_kv#">> | L])).
+-define(ETS_TABLE(L), list_to_atom("$redis_cache_copy_kv#" ++ atom_to_list(L))).
 
 -define(NOTICE, <<"$redis_cache_notice">>).
 
@@ -60,9 +63,11 @@ stop() ->
     application:stop(?MODULE).
 
 %%------------------------------------------------------------------------------
+-spec start_link([atom()]) -> {ok, pid()} | ignore | {error, any()}.
 start_link(Tables) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [Tables], []).
 
+-spec put_val(atom(), binary(), any(), any()) -> ok | {'EXIT', any()}.
 put_val(Table, Key, CKey, CVal) ->
     put_val(Table, Key, [{CKey, CVal}]).
 
@@ -94,11 +99,7 @@ get_val(Table, Key) ->
 get_val(Table, Key, CKey) ->
     case get_val(Table, Key) of
         null -> null;
-        Map ->
-            case maps:find(CKey, Map) of
-                {ok, Val} -> Val;
-                error -> null
-            end
+        Map -> maps:get(CKey, Map, null)
     end.
 
 reload() -> reload('$all').
@@ -126,9 +127,15 @@ get_table_vals(Table) ->
 get_redis_vals(Table) ->
     {ok, KeyList} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), <<"*">>])]),
     [begin
-         {ok, Vals} = eredis_pool:q([<<"HGETALL">>, ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)])]),
+         {ok, Vals} = eredis_pool:q([<<"HGETALL">>, ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)])]),
          {Key, Vals}
      end || Key <- KeyList].
+
+get_locks() ->
+    State = sys:get_state(?MODULE), State#state.locks.
+
+lock() ->
+    gen_server:call(?MODULE, lock).
 
 %%------------------------------------------------------------------------------
 init([Tables]) ->
@@ -136,8 +143,11 @@ init([Tables]) ->
     [do_load_table(Table) || Table <- Tables],
     {ok, #state{tables = Tables, reduce_max = Max, reduce_len = ?REDUCE_LEN(Max)}, 0}.
 
-handle_call({set_val, List}, _From, State) ->
-    {reply, catch do_set_val(List), State};
+handle_call({set_val, List}, {Master, _}, State) ->
+    case catch do_set_val(Master, State, List) of
+        {'EXIT', Reason} -> {reply, {error, Reason}, State};
+        State1 -> {reply, ok, State1}
+    end;
 handle_call({reload, ['$all']}, _From, State) ->
     {reply, catch do_reload_table(State#state.tables), State};
 handle_call({reload, List}, _From, State) ->
@@ -146,6 +156,9 @@ handle_call({clean, ['$all']}, _From, State) ->
     {reply, catch do_clean_table(State#state.tables), State};
 handle_call({clean, List}, _From, State) ->
     {reply, catch do_clean_table(List), State};
+handle_call(lock, {Master, _}, State) ->
+    {State1, Result} = do_lock(Master, State),
+    {reply, Result, State1};
 handle_call(_Call, _From, State) ->
     {reply, ok, State}.
 
@@ -158,9 +171,11 @@ terminate(_Reason, _State) ->
     ok.
 
 handle_info(timeout, State) ->
+    State1 = do_timeout(State),
     erlang:send_after(?TIMEOUT, self(), timeout),
-    {noreply, do_check_update(State)};
-
+    {noreply, State1};
+handle_info({'DOWN', _Ref, process, PID, _Reason}, State) ->
+    {noreply, do_check_deads(PID, State)};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -170,22 +185,26 @@ to_binary(X) when is_atom(X)    -> list_to_binary(atom_to_list(X));
 to_binary(X) when is_integer(X) -> integer_to_binary(X);
 to_binary(X) when is_binary(X)  -> X.
 
-get_type(X) when is_binary(X) -> binary;
-get_type(X) when is_list(X) -> list;
-get_type(X) when is_integer(X) -> integer;
-get_type(X) when is_atom(X) -> atom.
+get_type(X) when is_binary(X) -> <<"binary">>;
+get_type(X) when is_list(X) -> <<"list">>;
+get_type(X) when is_integer(X) -> <<"integer">>;
+get_type(X) when is_atom(X) -> <<"atom">>.
 
 put_type(X, binary) -> X;
+put_type(X, <<"binary">>) -> X;
 put_type(X, list) -> binary_to_list(X);
+put_type(X, <<"list">>) -> binary_to_list(X);
 put_type(X, integer) -> binary_to_integer(X);
-put_type(X, atom) -> list_to_atom(binary_to_list(X)).
+put_type(X, <<"integer">>) -> binary_to_integer(X);
+put_type(X, atom) -> list_to_atom(binary_to_list(X));
+put_type(X, <<"atom">>) -> list_to_atom(binary_to_list(X)).
 
 encode(V) ->
     jsx:encode(#{<<"type">> => get_type(V), <<"val">> => to_binary(V)}).
 
 decode(B) ->
     #{<<"type">> := T, <<"val">> := V} = jsx:decode(B, [return_maps]),
-    put_type(V, put_type(T, atom)).
+    put_type(V, T).
 
 %%------------------------------------------------------------------------------
 do_load_table(Table) ->
@@ -220,29 +239,40 @@ do_clean_table([Table | T]) ->
 do_clean_table([]) -> ok.
 
 %%------------------------------------------------------------------------------
-do_set_val([]) -> ok;
-do_set_val(List) ->
-    do_set_redis(List, []),
-    do_set_ets(List), ok.
+do_set_val(_Master, State, []) -> State;
+do_set_val(Master, #state{locks = Locks} = State, List) ->
+    case lists:keyfind(Master, 1, Locks) of
+        false ->
+            do_set_redis(null, List, []),
+            do_set_ets(List),
+            State;
+        {Master, Pool, Worker} ->
+            do_set_redis(Worker, List, []),
+            do_set_ets(List),
+            eredis_pool:lq(Worker, [<<"UNWATCH">>]),
+            eredis_pool:unlock(Pool, Worker),
+            State#state{locks = lists:keydelete(Master, 1, Locks)}
+    end.
 
-do_set_redis([{put_val, Table, Key, MKV} | T], Acc) ->
-    do_set_redis(T, do_form_put(Table, Key, MKV, []) ++ Acc);
-do_set_redis([{del_val, Table, Key} | T], Acc) ->
-    do_set_redis(T, do_form_del(Table, Key) ++ Acc);
-do_set_redis([], Acc) -> {ok, _} = eredis_pool:transaction(Acc).
+do_set_redis(Worker, [{put_val, Table, Key, MKV} | T], Acc) ->
+    do_set_redis(Worker,T, Acc ++ do_form_put(Table, Key, MKV, []));
+do_set_redis(Worker, [{del_val, Table, Key} | T], Acc) ->
+    do_set_redis(Worker,T, Acc ++ do_form_del(Table, Key) ++ Acc);
+do_set_redis(null, [], Acc) -> {ok, _} = eredis_pool:transaction(Acc);
+do_set_redis(Worker, [], Acc) -> {ok, _} = eredis_pool:lt(Worker, Acc).
 
 do_form_put(Table, Key, [{CK, CV} | T], Acc) ->
     do_form_put(Table, Key, T, [encode(CK), encode(CV)| Acc]);
 do_form_put(_Table, _Key, [], []) -> [];
 do_form_put(Table, Key, [], Acc) ->
-    Key1 = ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)]),
-    [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => Key1})],
-     [<<"HMSET">>, Key1] ++ Acc].
+    RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
+    [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})],
+     [<<"HMSET">>, RedisTable] ++ Acc].
 
 do_form_del(Table, Key) ->
-    Key1 = ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)]),
-    [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => Key1})],
-     [<<"DEL">>, ?REDIS_TABLE([?BIN(Table), "_", ?BIN(Key)])]].
+    RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
+    [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})],
+     [<<"DEL">>, RedisTable]].
 
 do_set_ets([{put_val, Table, Key, MKV} | T]) ->
     EtsTable = ?ETS_TABLE(Table),
@@ -260,6 +290,12 @@ do_get_map(Name, Key, MKV) ->
     end.
 
 %%------------------------------------------------------------------------------
+do_timeout(State) ->
+    case catch do_check_update(State) of
+        #state{} = NState -> NState;
+        {'EXIT', Reason} -> error_logger:error_msg("redis_cache error ~p~n", [{Reason}]), State
+    end.
+
 do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen} = State) ->
     case eredis_pool:q([<<"LLEN">>, ?NOTICE]) of
         {ok, NBinLen} ->
@@ -281,16 +317,16 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen} = 
 
 do_reduce_len(Len, RLen) ->
     Reduce = Len div RLen * RLen,
-    {ok, _} = eredis_pool:q([<<"LTRIM">>, ?NOTICE, Reduce, <<"-1">>]).
+    {ok, _} = eredis_pool:q([<<"LTRIM">>, ?NOTICE, 0, Len - Reduce -1]).
 
 do_update_len(Len, NLen) ->
-    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, Len, NLen - 1]),
-    [do_update_key(Val) || Val  <- List].
+    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, 0, NLen - Len - 1]),
+    [do_update_key(Val) || Val  <- lists:usort(List)].
 
 do_update_key(Val) ->
     #{<<"op">> := OP, <<"table">> := RedisTable} =jsx:decode(Val, [return_maps]),
     {Table, EtsKey} = do_parse_redis_table(RedisTable),
-    EtsTable = ?ETS_TABLE(put_type(Table, atom)),
+    EtsTable = ?ETS_TABLE(Table),
     case OP of
         <<"put">> ->
             {ok, List} = eredis_pool:q([<<"HGETALL">>, RedisTable]),
@@ -300,7 +336,35 @@ do_update_key(Val) ->
     end.
 
 do_parse_redis_table(RedisTable) ->
-    [<<>>, TK] = binary:split(RedisTable, ?REDIS_TABLE(<<>>)),
-    [Table, EtsKey] = re:split(TK, <<"_">>),
-    {Table, put_type(EtsKey, atom)}.
+    [<<>>, Left] = binary:split(RedisTable, ?REDIS_TABLE(<<>>)),
+    [Table, Left1] = re:split(Left, <<"@">>),
+    [Type, BinEtsKey] = re:split(Left1, <<"&">>),
+    {put_type(Table, atom), put_type(BinEtsKey, Type)}.
+
+%%------------------------------------------------------------------------------
+do_lock(Master, #state{locks = Locks} = State) ->
+    try
+        lists:keymember(Master, 1, Locks) andalso error(had_lock),
+        {ok, Pool, Worker} = do_touch(eredis_pool:lock()),
+        {ok, _} = do_touch(eredis_pool:lq(Worker, [<<"WATCH">>, ?NOTICE])),
+        State1 = do_timeout(State),
+        erlang:monitor(process, Master),
+        erlang:monitor(process, Worker),
+        {State1#state{locks = [{Master, Pool, Worker} | Locks]}, ok}
+    catch
+        E:R -> {State, {error, {E, R, erlang:get_stacktrace()}}}
+    end.
+
+do_touch({error, Reason}) -> error(Reason);
+do_touch(Result) -> Result.
+
+do_check_deads(PID, #state{locks = Locks} = State) ->
+    case lists:keyfind(PID, 1, Locks) of
+        false ->
+            State#state{locks = lists:keydelete(PID, 3, Locks)};
+        {PID, Pool, Worker} ->
+            eredis_pool:lq(Worker, [<<"UNWATCH">>]),
+            eredis_pool:unlock(Pool, Worker),
+            State#state{locks = lists:keydelete(PID, 1, Locks)}
+    end.
 
