@@ -296,17 +296,17 @@ do_timeout(State) ->
         {'EXIT', Reason} -> error_logger:error_msg("redis_cache error ~p~n", [{Reason}]), State
     end.
 
-do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen} = State) ->
+do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, tables = Tables} = State) ->
     case eredis_pool:q([<<"LLEN">>, ?NOTICE]) of
         {ok, NBinLen} ->
             case binary_to_integer(NBinLen) of
                 NLen when NLen >= Max ->
                     do_reduce_len(NLen, RLen), State;
                 NLen when NLen > Len ->
-                    do_update_len(Len, NLen),
+                    do_update_len(Len, NLen, Tables),
                     State#state{notice_len = NLen};
                 NLen when NLen < Len andalso NLen > Len rem RLen ->
-                    do_update_len(Len rem RLen, NLen),
+                    do_update_len(Len rem RLen, NLen, Tables),
                     State#state{notice_len = NLen};
                 NLen ->
                     State#state{notice_len = NLen}
@@ -319,20 +319,25 @@ do_reduce_len(Len, RLen) ->
     Reduce = Len div RLen * RLen,
     {ok, _} = eredis_pool:q([<<"LTRIM">>, ?NOTICE, 0, Len - Reduce -1]).
 
-do_update_len(Len, NLen) ->
+do_update_len(Len, NLen, Tables) ->
     {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, 0, NLen - Len - 1]),
-    [do_update_key(Val) || Val  <- lists:usort(List)].
+    [do_update_key(Val, Tables) || Val  <- lists:usort(List)].
 
-do_update_key(Val) ->
+do_update_key(Val, Tables) ->
     #{<<"op">> := OP, <<"table">> := RedisTable} =jsx:decode(Val, [return_maps]),
     {Table, EtsKey} = do_parse_redis_table(RedisTable),
-    EtsTable = ?ETS_TABLE(Table),
-    case OP of
-        <<"put">> ->
-            {ok, List} = eredis_pool:q([<<"HGETALL">>, RedisTable]),
-            ets:insert(EtsTable, {EtsKey, do_form_map(List, maps:new())});
-        <<"del">> ->
-            ets:delete(EtsTable, EtsKey)
+    case lists:member(Table, Tables) of
+        true ->
+            EtsTable = ?ETS_TABLE(Table),
+            case OP of
+                <<"put">> ->
+                    {ok, List} = eredis_pool:q([<<"HGETALL">>, RedisTable]),
+                    ets:insert(EtsTable, {EtsKey, do_form_map(List, maps:new())});
+                <<"del">> ->
+                    ets:delete(EtsTable, EtsKey)
+            end;
+        false ->
+            skip
     end.
 
 do_parse_redis_table(RedisTable) ->
