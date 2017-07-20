@@ -32,7 +32,7 @@
          get_table_vals/1,
          get_redis_vals/1]).
 
--export([lock/0, get_locks/0]).
+-export([lock/0, unlock/0, get_locks/0]).
 
 %% callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -54,6 +54,16 @@
 
 -define(REDUCE_MAX, 1000).
 -define(REDUCE_LEN(X), (X div 4 * 3)).
+
+-define(EVAL(Max, Red),
+        iolist_to_binary([<<"eval \"
+                            local Len = redis.pcall('LLEN', '$redis_cache_notice')
+                            if Len >= ">>, ?BIN(Max), <<" then
+                                local To = Len - ">>, ?BIN(Red), <<" - 1
+                                return redis.pcall('LTRIM', '$redis_cache_notice', 0, To)
+                            else
+                                return
+                            end\" 0">>])).
 
 %%------------------------------------------------------------------------------
 start() ->
@@ -137,6 +147,9 @@ get_locks() ->
 lock() ->
     gen_server:call(?MODULE, lock).
 
+unlock() ->
+    gen_server:call(?MODULE, unlock).
+
 %%------------------------------------------------------------------------------
 init([Tables]) ->
     Max = application:get_env(redis_cache, reduce_max, ?REDUCE_MAX),
@@ -159,6 +172,8 @@ handle_call({clean, List}, _From, State) ->
 handle_call(lock, {Master, _}, State) ->
     {State1, Result} = do_lock(Master, State),
     {reply, Result, State1};
+handle_call(unlock, {Master, _}, State) ->
+    {reply, ok, do_unlock(Master, State)};
 handle_call(_Call, _From, State) ->
     {reply, ok, State}.
 
@@ -296,17 +311,17 @@ do_timeout(State) ->
         {'EXIT', Reason} -> error_logger:error_msg("redis_cache error ~p~n", [{Reason}]), State
     end.
 
-do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen} = State) ->
+do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, tables = Tables} = State) ->
     case eredis_pool:q([<<"LLEN">>, ?NOTICE]) of
         {ok, NBinLen} ->
             case binary_to_integer(NBinLen) of
                 NLen when NLen >= Max ->
-                    do_reduce_len(NLen, RLen), State;
+                    do_reduce_len(Max, RLen), State;
                 NLen when NLen > Len ->
-                    do_update_len(Len, NLen),
+                    do_update_len(Len, NLen, Tables),
                     State#state{notice_len = NLen};
                 NLen when NLen < Len andalso NLen > Len rem RLen ->
-                    do_update_len(Len rem RLen, NLen),
+                    do_update_len(Len rem RLen, NLen, Tables),
                     State#state{notice_len = NLen};
                 NLen ->
                     State#state{notice_len = NLen}
@@ -315,24 +330,28 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen} = 
             State
     end.
 
-do_reduce_len(Len, RLen) ->
-    Reduce = Len div RLen * RLen,
-    {ok, _} = eredis_pool:q([<<"LTRIM">>, ?NOTICE, 0, Len - Reduce -1]).
+do_reduce_len(_Max, _RLen) -> ok.
+    %%{ok, _} = eredis_pool:q([?EVAL(Max, RLen)]).
 
-do_update_len(Len, NLen) ->
+do_update_len(Len, NLen, Tables) ->
     {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, 0, NLen - Len - 1]),
-    [do_update_key(Val) || Val  <- lists:usort(List)].
+    [do_update_key(Val, Tables) || Val  <- lists:usort(List)].
 
-do_update_key(Val) ->
+do_update_key(Val, Tables) ->
     #{<<"op">> := OP, <<"table">> := RedisTable} =jsx:decode(Val, [return_maps]),
     {Table, EtsKey} = do_parse_redis_table(RedisTable),
-    EtsTable = ?ETS_TABLE(Table),
-    case OP of
-        <<"put">> ->
-            {ok, List} = eredis_pool:q([<<"HGETALL">>, RedisTable]),
-            ets:insert(EtsTable, {EtsKey, do_form_map(List, maps:new())});
-        <<"del">> ->
-            ets:delete(EtsTable, EtsKey)
+    case lists:member(Table, Tables) of
+        true ->
+            EtsTable = ?ETS_TABLE(Table),
+            case OP of
+                <<"put">> ->
+                    {ok, List} = eredis_pool:q([<<"HGETALL">>, RedisTable]),
+                    ets:insert(EtsTable, {EtsKey, do_form_map(List, maps:new())});
+                <<"del">> ->
+                    ets:delete(EtsTable, EtsKey)
+            end;
+        false ->
+            skip
     end.
 
 do_parse_redis_table(RedisTable) ->
@@ -359,9 +378,14 @@ do_touch({error, Reason}) -> error(Reason);
 do_touch(Result) -> Result.
 
 do_check_deads(PID, #state{locks = Locks} = State) ->
+    case lists:keymember(PID, 3, Locks) of
+        false -> do_unlock(PID, State);
+        true -> State#state{locks = lists:keydelete(PID, 3, Locks)}
+    end.
+
+do_unlock(PID, #state{locks = Locks} = State) ->
     case lists:keyfind(PID, 1, Locks) of
-        false ->
-            State#state{locks = lists:keydelete(PID, 3, Locks)};
+        false -> State;
         {PID, Pool, Worker} ->
             eredis_pool:lq(Worker, [<<"UNWATCH">>]),
             eredis_pool:unlock(Pool, Worker),

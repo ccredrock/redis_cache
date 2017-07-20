@@ -32,7 +32,7 @@
          get_table_vals/1,
          get_redis_vals/1]).
 
--export([lock/0, get_locks/0]).
+-export([lock/0, unlock/0, get_locks/0]).
 
 %% callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -54,6 +54,15 @@
 
 -define(REDUCE_MAX, 1000).
 -define(REDUCE_LEN(X), (X div 4 * 3)).
+
+-define(RED_LUA(Max, Red),
+        iolist_to_binary([<<"local Len = redis.pcall('LLEN', '$redis_cache_notice')
+                            if Len >= ">>, ?BIN(Max), <<" then
+                                local To = Len - math.modf(Len / ">>, ?BIN(Red), <<") * ">>, ?BIN(Red), <<"- 1
+                                return redis.pcall('LTRIM', '$redis_cache_notice', 0, To)
+                            else
+                                return
+                            end">>])).
 
 %%------------------------------------------------------------------------------
 start() ->
@@ -137,6 +146,9 @@ get_locks() ->
 lock() ->
     gen_server:call(?MODULE, lock).
 
+unlock() ->
+    gen_server:call(?MODULE, unlock).
+
 %%------------------------------------------------------------------------------
 init([Tables]) ->
     Max = application:get_env(redis_cache, reduce_max, ?REDUCE_MAX),
@@ -144,10 +156,8 @@ init([Tables]) ->
     {ok, #state{tables = Tables, reduce_max = Max, reduce_len = ?REDUCE_LEN(Max)}, 0}.
 
 handle_call({set_val, List}, {Master, _}, State) ->
-    case catch do_set_val(Master, State, List) of
-        {'EXIT', Reason} -> {reply, {error, Reason}, State};
-        State1 -> {reply, ok, State1}
-    end;
+    {State1, Result} = do_set_val(Master, State, List),
+    {reply, Result, State1};
 handle_call({reload, ['$all']}, _From, State) ->
     {reply, catch do_reload_table(State#state.tables), State};
 handle_call({reload, List}, _From, State) ->
@@ -159,6 +169,8 @@ handle_call({clean, List}, _From, State) ->
 handle_call(lock, {Master, _}, State) ->
     {State1, Result} = do_lock(Master, State),
     {reply, Result, State1};
+handle_call(unlock, {Master, _}, State) ->
+    {reply, ok, do_unlock(Master, State)};
 handle_call(_Call, _From, State) ->
     {reply, ok, State}.
 
@@ -239,20 +251,26 @@ do_clean_table([Table | T]) ->
 do_clean_table([]) -> ok.
 
 %%------------------------------------------------------------------------------
-do_set_val(_Master, State, []) -> State;
+do_set_val(_Master, State, []) -> {State, ok};
 do_set_val(Master, #state{locks = Locks} = State, List) ->
     case lists:keyfind(Master, 1, Locks) of
         false ->
-            do_set_redis(null, List, []),
-            do_set_ets(List),
-            State;
-        {Master, Pool, Worker} ->
-            do_set_redis(Worker, List, []),
-            do_set_ets(List),
-            eredis_pool:lq(Worker, [<<"UNWATCH">>]),
-            eredis_pool:unlock(Pool, Worker),
-            State#state{locks = lists:keydelete(Master, 1, Locks)}
-    end.
+            try
+                do_set_redis(null, List, []),
+                do_set_ets(List),
+                {State, ok}
+            catch
+                E:R -> {State,{error, {E, R, erlang:get_stacktrace()}}}
+            end;
+        {Master, _Pool, Worker} ->
+            try
+                do_set_redis(Worker, List, []),
+                do_set_ets(List),
+                {do_unlock(Master, State), ok}
+            catch
+                E:R -> {do_unlock(Master, State), {error, {E, R, erlang:get_stacktrace()}}}
+            end
+        end.
 
 do_set_redis(Worker, [{put_val, Table, Key, MKV} | T], Acc) ->
     do_set_redis(Worker,T, Acc ++ do_form_put(Table, Key, MKV, []));
@@ -301,7 +319,7 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, ta
         {ok, NBinLen} ->
             case binary_to_integer(NBinLen) of
                 NLen when NLen >= Max ->
-                    do_reduce_len(NLen, RLen), State;
+                    do_reduce_len(Max, RLen), State;
                 NLen when NLen > Len ->
                     do_update_len(Len, NLen, Tables),
                     State#state{notice_len = NLen};
@@ -315,9 +333,8 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, ta
             State
     end.
 
-do_reduce_len(Len, RLen) ->
-    Reduce = Len div RLen * RLen,
-    {ok, _} = eredis_pool:q([<<"LTRIM">>, ?NOTICE, 0, Len - Reduce -1]).
+do_reduce_len(Max, RLen) ->
+    {ok, _} = eredis_pool:q([<<"eval">>, ?RED_LUA(Max, RLen), 0]).
 
 do_update_len(Len, NLen, Tables) ->
     {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, 0, NLen - Len - 1]),
@@ -364,9 +381,14 @@ do_touch({error, Reason}) -> error(Reason);
 do_touch(Result) -> Result.
 
 do_check_deads(PID, #state{locks = Locks} = State) ->
+    case lists:keymember(PID, 3, Locks) of
+        false -> do_unlock(PID, State);
+        true -> State#state{locks = lists:keydelete(PID, 3, Locks)}
+    end.
+
+do_unlock(PID, #state{locks = Locks} = State) ->
     case lists:keyfind(PID, 1, Locks) of
-        false ->
-            State#state{locks = lists:keydelete(PID, 3, Locks)};
+        false -> State;
         {PID, Pool, Worker} ->
             eredis_pool:lq(Worker, [<<"UNWATCH">>]),
             eredis_pool:unlock(Pool, Worker),
