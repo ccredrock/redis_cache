@@ -21,6 +21,15 @@
          get_val/2,     %% 获取
          get_val/3]).   %% 获取
 
+-export([get_ref/0,      %% 索引
+         rset_val/2,     %% 更新 || 删除
+         diff_ref/1,     %% 索引
+         rput_val/2,     %% 更新
+         rput_val/4,     %% 更新
+         rput_val/5,     %% 更新
+         rdel_val/2,     %% 删除
+         rdel_val/3]).   %% 删除
+
 -export([purge/0,       %% 净化系统
          clean/0,       %% 清理数据
          clean/1,       %% 清理数据
@@ -32,8 +41,6 @@
          get_table_vals/1,
          get_redis_vals/1]).
 
--export([lock/0, unlock/0, get_locks/0]).
-
 %% callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
@@ -43,26 +50,33 @@
 
 -define(TIMEOUT, 500).
 
--record(state, {tables = [], notice_len = 0, reduce_max = 0, reduce_len = 0, locks = []}).
-
 -define(BIN(V), to_binary(V)).
 
--define(REDIS_TABLE(L), iolist_to_binary([<<"$redis_cache_kv#">> | L])).
+-define(ETS, '$redis_cache').
 -define(ETS_TABLE(L), list_to_atom("$redis_cache_kv#" ++ atom_to_list(L))).
+-define(REDIS_TABLE(L), iolist_to_binary([<<"$redis_cache_kv#">> | L])).
 
--define(NOTICE, <<"$redis_cache_notice">>).
+-define(NOTICE,  <<"$redis_cache_notice">>).
 
 -define(REDUCE_MAX, 1000).
 -define(REDUCE_LEN(X), (X div 4 * 3)).
 
 -define(RED_LUA(Max, Red),
-        iolist_to_binary([<<"local Len = redis.pcall('LLEN', '$redis_cache_notice')
-                            if Len >= ">>, ?BIN(Max), <<" then
-                                local To = Len - math.modf(Len / ">>, ?BIN(Red), <<") * ">>, ?BIN(Red), <<"- 1
-                                return redis.pcall('LTRIM', '$redis_cache_notice', 0, To)
-                            else
-                                return
-                            end">>])).
+        iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
+                           if Len >= ", ?BIN(Max), " then
+                                local To = Len - math.modf(Len / ", ?BIN(Red), ") * ", ?BIN(Red), "- 1
+                                redis.pcall('LTRIM', '", ?NOTICE, "', 0, To)
+                           end"])).
+
+-define(SET_LUA(Len, Exec),
+        iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
+                          if Len == ", ?BIN(Len), " then ",
+                          Exec, " return {'OK', Len}
+                          else
+                            return {'ERROR', Len}
+                          end"])).
+
+-record(state, {tables = [], notice_len = 0, reduce_max = 0, reduce_len = 0}).
 
 %%------------------------------------------------------------------------------
 start() ->
@@ -76,6 +90,7 @@ stop() ->
 start_link(Tables) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [Tables], []).
 
+%%------------------------------------------------------------------------------
 -spec put_val(atom(), binary(), any(), any()) -> ok | {'EXIT', any()}.
 put_val(Table, Key, CKey, CVal) ->
     put_val(Table, Key, [{CKey, CVal}]).
@@ -86,14 +101,14 @@ put_val(Table, Key, MKV) ->
 
 %% [{table, key, [{ckey, cval}]}]
 put_val(List) ->
-    set_val([{put_val, T, K, M} || {T, K, M} <- List]).
+    set_val([{put, T, K, M} || {T, K, M} <- List]).
 
 del_val(Table, Key) ->
     del_val([{Table, Key}]).
 
 %% [{table, key}]
 del_val(List) ->
-    set_val([{del_val, T, K} || {T, K} <- List]).
+    set_val([{del, T, K} || {T, K} <- List]).
 
 %% [{op, ...}]
 set_val(List) ->
@@ -111,6 +126,37 @@ get_val(Table, Key, CKey) ->
         Map -> maps:get(CKey, Map, null)
     end.
 
+%%------------------------------------------------------------------------------
+get_ref() ->
+    [{ref, Ref}] = ets:lookup(?ETS, ref), Ref.
+
+%% [{op, ...}]
+rset_val(Ref, List) ->
+    gen_server:call(?MODULE, {rset_val, Ref, List}).
+
+diff_ref(Ref) ->
+    gen_server:call(?MODULE, {diff_ref, Ref}).
+
+-spec rput_val(atom(), binary(), any(), any()) -> ok | {'EXIT', any()}.
+rput_val(Ref, Table, Key, CKey, CVal) ->
+    put_val(Ref, Table, Key, [{CKey, CVal}]).
+
+%% [{ckey, cval}]
+rput_val(Ref, Table, Key, MKV) ->
+    rput_val(Ref, [{Table, Key, MKV}]).
+
+%% [{table, key, [{ckey, cval}]}]
+rput_val(Ref, List) ->
+    rset_val(Ref, [{put, T, K, M} || {T, K, M} <- List]).
+
+rdel_val(Ref, Table, Key) ->
+    rdel_val(Ref, [{Table, Key}]).
+
+%% [{table, key}]
+rdel_val(Ref, List) ->
+    rset_val(Ref, [{del, T, K} || {T, K} <- List]).
+
+%%------------------------------------------------------------------------------
 reload() -> reload('$all').
 reload(Table) when is_atom(Table) -> reload([Table]);
 reload(List) -> gen_server:call(?MODULE, {reload, List}).
@@ -140,24 +186,20 @@ get_redis_vals(Table) ->
          {Key, Vals}
      end || Key <- KeyList].
 
-get_locks() ->
-    State = sys:get_state(?MODULE), State#state.locks.
-
-lock() ->
-    gen_server:call(?MODULE, lock).
-
-unlock() ->
-    gen_server:call(?MODULE, unlock).
-
 %%------------------------------------------------------------------------------
 init([Tables]) ->
     Max = application:get_env(redis_cache, reduce_max, ?REDUCE_MAX),
+    Len = do_load_len(),
     [do_load_table(Table) || Table <- Tables],
-    {ok, #state{tables = Tables, reduce_max = Max, reduce_len = ?REDUCE_LEN(Max)}, 0}.
+    {ok, #state{tables = Tables, notice_len = Len, reduce_max = Max, reduce_len = ?REDUCE_LEN(Max)}, 0}.
 
-handle_call({set_val, List}, {Master, _}, State) ->
-    {State1, Result} = do_set_val(Master, State, List),
-    {reply, Result, State1};
+handle_call({set_val, List}, _, State) ->
+    {reply, catch do_set_val(List), State};
+handle_call({rset_val, Ref, List}, _, State) ->
+    case catch do_rset_val(State, Ref, List) of
+        {'EXIT', _} = Result -> {reply, Result, State};
+        State1 -> {reply, ok, State1}
+    end;
 handle_call({reload, ['$all']}, _From, State) ->
     {reply, catch do_reload_table(State#state.tables), State};
 handle_call({reload, List}, _From, State) ->
@@ -166,11 +208,8 @@ handle_call({clean, ['$all']}, _From, State) ->
     {reply, catch do_clean_table(State#state.tables), State};
 handle_call({clean, List}, _From, State) ->
     {reply, catch do_clean_table(List), State};
-handle_call(lock, {Master, _}, State) ->
-    {State1, Result} = do_lock(Master, State),
-    {reply, Result, State1};
-handle_call(unlock, {Master, _}, State) ->
-    {reply, ok, do_unlock(Master, State)};
+handle_call({diff_ref, Ref}, _, State) ->
+    {reply, do_diff_ref(Ref, State), State};
 handle_call(_Call, _From, State) ->
     {reply, ok, State}.
 
@@ -186,8 +225,6 @@ handle_info(timeout, State) ->
     State1 = do_timeout(State),
     erlang:send_after(?TIMEOUT, self(), timeout),
     {noreply, State1};
-handle_info({'DOWN', _Ref, process, PID, _Reason}, State) ->
-    {noreply, do_check_deads(PID, State)};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -246,57 +283,40 @@ do_clean_table([Table | T]) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:info(EtsTable) =/= undefined andalso ets:delete_all_objects(EtsTable),
     {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), <<"*">>])]),
-    [{ok, _} = eredis_pool:q([<<"DEL">>, RedisTable]) || RedisTable <- List],
+    [{ok, _} = eredis_pool:transaction([[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => X})],
+                                        [<<"DEL">>, X]]) || X <- List],
     do_clean_table(T);
 do_clean_table([]) -> ok.
 
+do_load_len() ->
+    ets:new(?ETS, [named_table, public, {read_concurrency, true}]),
+    {ok, BinLen} = eredis_pool:q([<<"LLEN">>, ?NOTICE]),
+    Len = binary_to_integer(BinLen),
+    ets:insert_new(?ETS, {ref, Len}), Len.
+
 %%------------------------------------------------------------------------------
-do_set_val(_Master, State, []) -> {State, ok};
-do_set_val(Master, #state{locks = Locks} = State, List) ->
-    case lists:keyfind(Master, 1, Locks) of
-        false ->
-            try
-                do_set_redis(null, List, []),
-                do_set_ets(List),
-                {State, ok}
-            catch
-                E:R -> {State,{error, {E, R, erlang:get_stacktrace()}}}
-            end;
-        {Master, _Pool, Worker} ->
-            try
-                do_set_redis(Worker, List, []),
-                do_set_ets(List),
-                {do_unlock(Master, State), ok}
-            catch
-                E:R -> {do_unlock(Master, State), {error, {E, R, erlang:get_stacktrace()}}}
-            end
-        end.
+do_set_val([]) -> skip;
+do_set_val(List) ->
+    do_set_redis(List, []),
+    do_set_ets(List), ok.
 
-do_set_redis(Worker, [{put_val, Table, Key, MKV} | T], Acc) ->
-    do_set_redis(Worker,T, Acc ++ do_form_put(Table, Key, MKV, []));
-do_set_redis(Worker, [{del_val, Table, Key} | T], Acc) ->
-    do_set_redis(Worker,T, Acc ++ do_form_del(Table, Key) ++ Acc);
-do_set_redis(null, [], Acc) -> {ok, _} = eredis_pool:transaction(Acc);
-do_set_redis(Worker, [], Acc) -> {ok, _} = eredis_pool:lt(Worker, Acc).
-
-do_form_put(Table, Key, [{CK, CV} | T], Acc) ->
-    do_form_put(Table, Key, T, [encode(CK), encode(CV)| Acc]);
-do_form_put(_Table, _Key, [], []) -> [];
-do_form_put(Table, Key, [], Acc) ->
+do_set_redis([{put, Table, Key, MKV} | T], Acc) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
-    [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})],
-     [<<"HMSET">>, RedisTable] ++ Acc].
-
-do_form_del(Table, Key) ->
+    do_set_redis(T, Acc ++
+                 [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})],
+                  [<<"HMSET">>, RedisTable] ++ lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])]);
+do_set_redis([{del, Table, Key} | T], Acc) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
-    [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})],
-     [<<"DEL">>, RedisTable]].
+    do_set_redis(T, Acc ++
+                 [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})],
+                  [<<"DEL">>, RedisTable]]);
+do_set_redis([], Acc) -> {ok, _} = eredis_pool:transaction(Acc).
 
-do_set_ets([{put_val, Table, Key, MKV} | T]) ->
+do_set_ets([{put, Table, Key, MKV} | T]) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:insert(EtsTable, {Key, do_get_map(EtsTable, Key, MKV)}),
     do_set_ets(T);
-do_set_ets([{del_val, Table, Key} | T]) ->
+do_set_ets([{del, Table, Key} | T]) ->
     ets:delete(?ETS_TABLE(Table), Key),
     do_set_ets(T);
 do_set_ets([]) -> skip.
@@ -306,6 +326,44 @@ do_get_map(Name, Key, MKV) ->
         [] -> maps:from_list(MKV);
         [{_Key, Map}] -> maps:merge(Map, maps:from_list(MKV))
     end.
+
+%%------------------------------------------------------------------------------
+do_rset_val(State, _Ref, []) -> State;
+do_rset_val(#state{notice_len = Len} = State, Ref, List) ->
+    RedisLen = do_rset_redis(Ref, List, 0, [], []),
+    do_set_ets(List),
+    case binary_to_integer(RedisLen) =:= Len of
+        true ->
+            NLen = Len + length(List),
+            ets:insert(?ETS, {ref, NLen}),
+            State#state{notice_len = NLen};
+        false ->
+            State
+    end.
+
+do_rset_redis(Ref, [{put, Table, Key, MKV} | T], Nth, Es, As) ->
+    MKV1 = [[", '", encode(CK), "', '", encode(CV), "' "] || {CK, CV} <- MKV],
+    MKV1 = [[", '", encode(CK), "', '", encode(CV), "' "] || {CK, CV} <- MKV],
+    RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
+    {Nth1, Keys} = do_form_lua_key(MKV, Nth + 1, []),
+    do_rset_redis(Ref, T, Nth1,
+                  Es ++ [["redis.pcall('LPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
+                          " redis.pcall('HMSET', '", RedisTable, "'", Keys, ")"]],
+                  As ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})
+                         | lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])]);
+do_rset_redis(Ref, [{del, Table, Key} | T], Nth, Es, As) ->
+    RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
+    do_rset_redis(Ref, T, Nth + 1,
+                  Es ++ ["redis.pcall('LPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
+                         " redis.pcall('DEL', '", RedisTable, "')"],
+                  As ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})]);
+do_rset_redis(Ref, [], Nth, Es, As) ->
+    {ok, [<<"OK">>, Len]} = eredis_pool:q([<<"eval">>, ?SET_LUA(Ref, Es), Nth] ++ As), Len.
+
+do_form_lua_key([_ | T], Nth, Acc) ->
+    V = [", KEYS[", integer_to_binary(Nth + 1), "], KEYS[", integer_to_binary(Nth + 2), "]"],
+    do_form_lua_key(T, Nth + 2, [V | Acc]);
+do_form_lua_key([], Nth, Acc) -> {Nth, Acc}.
 
 %%------------------------------------------------------------------------------
 do_timeout(State) ->
@@ -322,11 +380,14 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, ta
                     do_reduce_len(Max, RLen), State;
                 NLen when NLen > Len ->
                     do_update_len(Len, NLen, Tables),
+                    ets:insert(?ETS, {ref, NLen}),
                     State#state{notice_len = NLen};
                 NLen when NLen < Len andalso NLen > Len rem RLen ->
                     do_update_len(Len rem RLen, NLen, Tables),
+                    ets:insert(?ETS, {ref, NLen}),
                     State#state{notice_len = NLen};
                 NLen ->
+                    ets:insert(?ETS, {ref, NLen}),
                     State#state{notice_len = NLen}
             end;
         _ ->
@@ -341,7 +402,7 @@ do_update_len(Len, NLen, Tables) ->
     [do_update_key(Val, Tables) || Val  <- lists:usort(List)].
 
 do_update_key(Val, Tables) ->
-    #{<<"op">> := OP, <<"table">> := RedisTable} =jsx:decode(Val, [return_maps]),
+    #{<<"op">> := OP, <<"table">> := RedisTable} = jsx:decode(Val, [return_maps]),
     {Table, EtsKey} = do_parse_redis_table(RedisTable),
     case lists:member(Table, Tables) of
         true ->
@@ -364,34 +425,23 @@ do_parse_redis_table(RedisTable) ->
     {put_type(Table, atom), put_type(BinEtsKey, Type)}.
 
 %%------------------------------------------------------------------------------
-do_lock(Master, #state{locks = Locks} = State) ->
-    try
-        lists:keymember(Master, 1, Locks) andalso error(had_lock),
-        {ok, Pool, Worker} = do_touch(eredis_pool:lock()),
-        {ok, _} = do_touch(eredis_pool:lq(Worker, [<<"WATCH">>, ?NOTICE])),
-        State1 = do_timeout(State),
-        erlang:monitor(process, Master),
-        erlang:monitor(process, Worker),
-        {State1#state{locks = [{Master, Pool, Worker} | Locks]}, ok}
-    catch
-        E:R -> {State, {error, {E, R, erlang:get_stacktrace()}}}
+do_diff_ref(RefLen, #state{tables = Tables} = State) ->
+    {From, To} = do_from_to(RefLen, State),
+    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, From, To]),
+    do_form_list(Tables, lists:usort(List), []).
+
+do_from_to(RefLen, #state{notice_len = Len, reduce_len = RLen}) ->
+    case RefLen < Len of
+        true -> {0, Len - RefLen - 1};
+        false -> {0, Len - RefLen rem RLen - 1}
     end.
 
-do_touch({error, Reason}) -> error(Reason);
-do_touch(Result) -> Result.
-
-do_check_deads(PID, #state{locks = Locks} = State) ->
-    case lists:keymember(PID, 3, Locks) of
-        false -> do_unlock(PID, State);
-        true -> State#state{locks = lists:keydelete(PID, 3, Locks)}
-    end.
-
-do_unlock(PID, #state{locks = Locks} = State) ->
-    case lists:keyfind(PID, 1, Locks) of
-        false -> State;
-        {PID, Pool, Worker} ->
-            eredis_pool:lq(Worker, [<<"UNWATCH">>]),
-            eredis_pool:unlock(Pool, Worker),
-            State#state{locks = lists:keydelete(PID, 1, Locks)}
-    end.
+do_form_list(Tables, [Val | T], Acc) ->
+    #{<<"op">> := OP, <<"table">> := RedisTable} = jsx:decode(Val, [return_maps]),
+    {Table, EtsKey} = do_parse_redis_table(RedisTable),
+    case lists:member(Table, Tables) of
+        true -> do_form_list(Tables, T, [{OP, ?ETS_TABLE(Table), EtsKey} | Acc]);
+        false -> do_form_list(Tables, T, Acc)
+    end;
+do_form_list(_Tables, [], Acc) -> Acc.
 

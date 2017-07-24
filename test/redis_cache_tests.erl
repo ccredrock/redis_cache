@@ -33,28 +33,15 @@ basic_test_() ->
                  timer:sleep(500),
                  ?assertEqual(null, redis_cache_copy:get_val(test1, key1, ckey1))
          end},
-       {"lock",
+       {"ref",
          fun() ->
-                 ?assertEqual(0, length(redis_cache:get_locks())),
-                 ?assertEqual(ok, redis_cache:lock()),
-                 ?assertEqual(1, length(redis_cache:get_locks())),
-                 ?assertEqual(ok, redis_cache:put_val(test1, key1, ckey1, cval4)),
-                 ?assertEqual(0, length(redis_cache:get_locks())),
-                 ?assertEqual(ok, redis_cache:lock()),
-                 ?assertEqual(1, length(redis_cache:get_locks())),
-                 ?assertEqual(ok, redis_cache:unlock()),
-                 ?assertEqual(0, length(redis_cache:get_locks())),
-                 ?assertEqual(ok, redis_cache:lock()),
-                 ?assertEqual(ok, redis_cache_copy:put_val(test1, key1, ckey1, cval5)),
-                 ?assert(ok =/= redis_cache:put_val(test1, key1, ckey1, cval6)),
-                 timer:sleep(500),
-                 ?assertEqual(cval5, redis_cache:get_val(test1, key1, ckey1)),
-                 PID = spawn(fun() -> ok = redis_cache:lock(), timer:sleep(5000) end),
-                 timer:sleep(500),
-                 ?assertEqual(1, length(redis_cache:get_locks())),
-                 exit(PID, kill),
+                 Ref = redis_cache:get_ref(),
+                 ?assertEqual(ok, redis_cache:rput_val(Ref, [{test1, key1, [{ckey1, cval14}]}])),
                  timer:sleep(600),
-                 ?assertEqual(0, length(redis_cache:get_locks()))
+                 ?assertEqual(cval14, redis_cache_copy:get_val(test1, key1, ckey1)),
+                 ?assert(redis_cache:rput_val(-1, [{test1, key1, [{ckey1, cval14}]}]) =/= ok),
+                 ?assertEqual(1, length(redis_cache:diff_ref(Ref))),
+                 ?assertEqual(ok, redis_cache:del_val(test1, key1))
          end},
        {"reduce",
          fun() ->
@@ -66,7 +53,11 @@ basic_test_() ->
                  ?assertEqual(750, redis_cache:get_cache_notice_len()),
                  redis_cache:put_val([{test1, X, [{ckey1, cval4}]} || X <- lists:seq(751, 1000)]),
                  timer:sleep(800),
-                 ?assertEqual(250, redis_cache:get_redis_notice_len()),
+                 ?assertEqual(250, redis_cache:get_redis_notice_len())
+         end},
+       {"purge",
+         fun() ->
+                 ?assertEqual(ok, redis_cache:purge()),
                  ?assertEqual(ok, redis_cache:purge())
          end}
       ]}
