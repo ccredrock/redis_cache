@@ -36,9 +36,9 @@ basic_test_() ->
        {"ref",
          fun() ->
                  Ref = redis_cache:get_ref(),
-                 ?assertEqual(ok, redis_cache:rput_val(Ref, [{test1, key1, [{ckey1, cval14}]}])),
+                 ?assertEqual(ok, redis_cache:rput_val(Ref, [{test1, key1, [{ckey1, [{x, a}]}]}])),
                  timer:sleep(600),
-                 ?assertEqual(cval14, redis_cache_copy:get_val(test1, key1, ckey1)),
+                 ?assertEqual(#{<<"x">> => <<"a">>}, redis_cache_copy:get_val(test1, key1, ckey1)),
                  ?assert(redis_cache:rput_val(-1, [{test1, key1, [{ckey1, cval14}]}]) =/= ok),
                  ?assertEqual(1, length(redis_cache:diff_ref(Ref))),
                  ?assertEqual(ok, redis_cache:del_val(test1, key1))
