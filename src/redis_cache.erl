@@ -18,6 +18,7 @@
          del_val/1,     %% 删除
          del_val/2,     %% 删除
          set_val/1,     %% 更新 || 删除
+         get_val/1,     %% 获取
          get_val/2,     %% 获取
          get_val/3]).   %% 获取
 
@@ -114,6 +115,9 @@ del_val(List) ->
 set_val(List) ->
     gen_server:call(?MODULE, {set_val, List}).
 
+get_val(Table) ->
+    ets:tab2list(?ETS_TABLE(Table)).
+
 get_val(Table, Key) ->
     case ets:lookup(?ETS_TABLE(Table), Key) of
         [{Key, Map}] -> Map;
@@ -180,7 +184,7 @@ get_table_vals(Table) ->
     ets:tab2list(?ETS_TABLE(Table)).
 
 get_redis_vals(Table) ->
-    {ok, KeyList} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), <<"*">>])]),
+    {ok, KeyList} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
     [begin
          {ok, Vals} = eredis_pool:q([<<"HGETALL">>, ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)])]),
          {Key, Vals}
@@ -229,24 +233,34 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 %%------------------------------------------------------------------------------
-to_binary(X) when is_list(X)    -> list_to_binary(X);
 to_binary(X) when is_atom(X)    -> list_to_binary(atom_to_list(X));
 to_binary(X) when is_integer(X) -> integer_to_binary(X);
-to_binary(X) when is_binary(X)  -> X.
+to_binary(X) when is_binary(X)  -> X;
+to_binary(X) when is_list(X) ->
+    case io_lib:printable_list(X) of
+        true -> list_to_binary(X);
+        false -> jsx:encode(X)
+    end.
 
 get_type(X) when is_binary(X) -> <<"binary">>;
-get_type(X) when is_list(X) -> <<"list">>;
 get_type(X) when is_integer(X) -> <<"integer">>;
-get_type(X) when is_atom(X) -> <<"atom">>.
+get_type(X) when is_atom(X) -> <<"atom">>;
+get_type(X) ->
+    case io_lib:printable_list(X) of
+        true -> <<"string">>;
+        false -> <<"json">>
+    end.
 
 put_type(X, binary) -> X;
 put_type(X, <<"binary">>) -> X;
-put_type(X, list) -> binary_to_list(X);
-put_type(X, <<"list">>) -> binary_to_list(X);
+put_type(X, string) -> binary_to_list(X);
+put_type(X, <<"string">>) -> binary_to_list(X);
 put_type(X, integer) -> binary_to_integer(X);
 put_type(X, <<"integer">>) -> binary_to_integer(X);
 put_type(X, atom) -> list_to_atom(binary_to_list(X));
-put_type(X, <<"atom">>) -> list_to_atom(binary_to_list(X)).
+put_type(X, <<"atom">>) -> list_to_atom(binary_to_list(X));
+put_type(X, _T) when not is_binary(X) -> X;
+put_type(X, T) when T =:= json orelse T =:= <<"json">> -> jsx:decode(X, [return_maps]).
 
 encode(V) ->
     jsx:encode(#{<<"type">> => get_type(V), <<"val">> => to_binary(V)}).
@@ -259,7 +273,7 @@ decode(B) ->
 do_load_table(Table) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:new(EtsTable, [named_table, public, {read_concurrency, true}]),
-    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), <<"*">>])]),
+    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
     [do_load_table_key(EtsTable, RedisTable) || RedisTable <- List].
 
 do_load_table_key(EtsTable, RedisTable) ->
@@ -274,7 +288,7 @@ do_form_map([], Map) -> Map.
 do_reload_table([Table | T]) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:delete_all_objects(EtsTable),
-    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), <<"*">>])]),
+    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
     [do_load_table_key(EtsTable, RedisTable) || RedisTable <- List],
     do_reload_table(T);
 do_reload_table([]) -> ok.
@@ -282,7 +296,7 @@ do_reload_table([]) -> ok.
 do_clean_table([Table | T]) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:info(EtsTable) =/= undefined andalso ets:delete_all_objects(EtsTable),
-    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), <<"*">>])]),
+    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
     [{ok, _} = eredis_pool:transaction([[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => X})],
                                         [<<"DEL">>, X]]) || X <- List],
     do_clean_table(T);
