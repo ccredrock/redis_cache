@@ -236,7 +236,7 @@ handle_info(_Info, State) ->
 to_binary(X) when is_atom(X)    -> list_to_binary(atom_to_list(X));
 to_binary(X) when is_integer(X) -> integer_to_binary(X);
 to_binary(X) when is_binary(X)  -> X;
-to_binary(X) when is_list(X) ->
+to_binary(X) ->
     case io_lib:printable_list(X) of
         true -> list_to_binary(X);
         false -> jsx:encode(X)
