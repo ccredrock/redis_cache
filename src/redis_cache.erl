@@ -49,9 +49,9 @@
 %%------------------------------------------------------------------------------
 -behaviour(gen_server).
 
--define(TIMEOUT, 500).
-
--define(BIN(V), to_binary(V)).
+-define(TIMEOUT, 50).
+-define(REDUCE_MAX, 1000).
+-define(REDUCE_LEN(X), (X div 4 * 3)).
 
 -define(ETS, '$redis_cache').
 -define(ETS_TABLE(L), list_to_atom("$redis_cache_kv#" ++ atom_to_list(L))).
@@ -59,8 +59,7 @@
 
 -define(NOTICE,  <<"$redis_cache_notice">>).
 
--define(REDUCE_MAX, 1000).
--define(REDUCE_LEN(X), (X div 4 * 3)).
+-define(BIN(V), to_binary(V)).
 
 -define(RED_LUA(Max, Red),
         iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
@@ -77,7 +76,7 @@
                             return {'ERROR', Len}
                           end"])).
 
--record(state, {tables = [], notice_len = 0, reduce_max = 0, reduce_len = 0}).
+-record(state, {tables = [], notice_len = 0, reduce_max = 0, check_time = 0, reduce_len = 0}).
 
 %%------------------------------------------------------------------------------
 start() ->
@@ -143,7 +142,7 @@ diff_ref(Ref) ->
 
 -spec rput_val(atom(), binary(), any(), any()) -> ok | {'EXIT', any()}.
 rput_val(Ref, Table, Key, CKey, CVal) ->
-    put_val(Ref, Table, Key, [{CKey, CVal}]).
+    rput_val(Ref, Table, Key, [{CKey, CVal}]).
 
 %% [{ckey, cval}]
 rput_val(Ref, Table, Key, MKV) ->
@@ -193,9 +192,13 @@ get_redis_vals(Table) ->
 %%------------------------------------------------------------------------------
 init([Tables]) ->
     Max = application:get_env(redis_cache, reduce_max, ?REDUCE_MAX),
+    Time = application:get_env(redis_cache, check_time, ?TIMEOUT),
     Len = do_load_len(),
     [do_load_table(Table) || Table <- Tables],
-    {ok, #state{tables = Tables, notice_len = Len, reduce_max = Max, reduce_len = ?REDUCE_LEN(Max)}, 0}.
+    {ok, #state{tables = Tables, notice_len = Len,
+                reduce_max = Max,
+                check_time = Time,
+                reduce_len = ?REDUCE_LEN(Max)}, 0}.
 
 handle_call({set_val, List}, _, State) ->
     {reply, catch do_set_val(List), State};
@@ -227,7 +230,7 @@ terminate(_Reason, _State) ->
 
 handle_info(timeout, State) ->
     State1 = do_timeout(State),
-    erlang:send_after(?TIMEOUT, self(), timeout),
+    erlang:send_after(State#state.check_time, self(), timeout),
     {noreply, State1};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -370,7 +373,7 @@ do_rset_redis(Ref, [{del, Table, Key} | T], Nth, Es, As) ->
     do_rset_redis(Ref, T, Nth + 1,
                   Es ++ ["redis.pcall('LPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
                          " redis.pcall('DEL', '", RedisTable, "')"],
-                  As ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})]);
+                  As ++ [jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})]);
 do_rset_redis(Ref, [], Nth, Es, As) ->
     {ok, [<<"OK">>, Len]} = eredis_pool:q([<<"eval">>, ?SET_LUA(Ref, Es), Nth] ++ As), Len.
 
