@@ -23,8 +23,8 @@
          get_val/3]).   %% 获取
 
 -export([get_ref/0,      %% 索引
+         diff_ref/2,     %% 索引
          rset_val/2,     %% 更新 || 删除
-         diff_ref/1,     %% 索引
          rput_val/2,     %% 更新
          rput_val/4,     %% 更新
          rput_val/5,     %% 更新
@@ -50,8 +50,8 @@
 -behaviour(gen_server).
 
 -define(TIMEOUT, 50).
--define(REDUCE_MAX, 1000).
--define(REDUCE_LEN(X), (X div 4 * 3)).
+-define(REDUCE_MAX, 10000). %% 队列总长度
+-define(REDUCE_LEN(X), (X div 4 * 3)). %% 清理单位长度
 
 -define(ETS, '$redis_cache').
 -define(ETS_TABLE(L), list_to_atom("$redis_cache_kv#" ++ atom_to_list(L))).
@@ -76,7 +76,15 @@
                             return {'ERROR', Len}
                           end"])).
 
--record(state, {tables = [], notice_len = 0, reduce_max = 0, check_time = 0, reduce_len = 0}).
+-define(DIF_LUA(From, To),
+        iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
+                           return redis.pcall('LRANGE', '", ?NOTICE, "', Len - ", ?BIN(To), ", Len - ", ?BIN(From), " - 1)"])).
+
+-record(state, {tables     = [],    %% 所有关心的表
+                notice_len = 0,     %% 当前列表长度
+                reduce_max = 0,     %% 最大列表长度
+                check_time = 0,     %% 检查间隔
+                reduce_len = 0}).   %% 清理单位长度
 
 %%------------------------------------------------------------------------------
 start() ->
@@ -137,8 +145,9 @@ get_ref() ->
 rset_val(Ref, List) ->
     gen_server:call(?MODULE, {rset_val, Ref, List}).
 
-diff_ref(Ref) ->
-    gen_server:call(?MODULE, {diff_ref, Ref}).
+diff_ref(From, From) -> [];
+diff_ref(From, To) when From >= 0 andalso To >= 0 ->
+    gen_server:call(?MODULE, {diff_ref, From, To}).
 
 -spec rput_val(atom(), binary(), any(), any()) -> ok | {'EXIT', any()}.
 rput_val(Ref, Table, Key, CKey, CVal) ->
@@ -215,8 +224,8 @@ handle_call({clean, ['$all']}, _From, State) ->
     {reply, catch do_clean_table(State#state.tables), State};
 handle_call({clean, List}, _From, State) ->
     {reply, catch do_clean_table(List), State};
-handle_call({diff_ref, Ref}, _, State) ->
-    {reply, do_diff_ref(Ref, State), State};
+handle_call({diff_ref, Old, New}, _, State) ->
+    {reply, do_diff_ref(Old, New, State), State};
 handle_call(_Call, _From, State) ->
     {reply, ok, State}.
 
@@ -389,21 +398,22 @@ do_timeout(State) ->
         {'EXIT', Reason} -> error_logger:error_msg("redis_cache error ~p~n", [{Reason}]), State
     end.
 
+%% reduce_max
 do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, tables = Tables} = State) ->
     case eredis_pool:q([<<"LLEN">>, ?NOTICE]) of
         {ok, NBinLen} ->
             case binary_to_integer(NBinLen) of
-                NLen when NLen >= Max ->
+                NLen when NLen >= Max ->                            %% 开始清理 清理队尾1/4
                     do_reduce_len(Max, RLen), State;
-                NLen when NLen > Len ->
+                NLen when NLen > Len ->                             %% 增长同步长度
                     do_update_len(Len, NLen, Tables),
                     ets:insert(?ETS, {ref, NLen}),
                     State#state{notice_len = NLen};
-                NLen when NLen < Len andalso NLen > Len rem RLen ->
+                NLen when NLen < Len andalso NLen > Len rem RLen -> %% 清理后增长同步
                     do_update_len(Len rem RLen, NLen, Tables),
                     ets:insert(?ETS, {ref, NLen}),
                     State#state{notice_len = NLen};
-                NLen ->
+                NLen ->                                             %% 清理后未增长同步
                     ets:insert(?ETS, {ref, NLen}),
                     State#state{notice_len = NLen}
             end;
@@ -442,22 +452,22 @@ do_parse_redis_table(RedisTable) ->
     {put_type(Table, atom), put_type(BinEtsKey, Type)}.
 
 %%------------------------------------------------------------------------------
-do_diff_ref(RefLen, #state{tables = Tables} = State) ->
-    {From, To} = do_from_to(RefLen, State),
-    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, From, To]),
-    do_form_list(Tables, lists:usort(List), []).
+do_diff_ref(Old, New, #state{tables = Tables} = State) ->
+    {From, To} = do_from_to(Old, New, State),
+    {ok, List} = eredis_pool:q([<<"eval">>, ?DIF_LUA(From, To), 0]),
+    do_form_list(Tables, List, []).
 
-do_from_to(RefLen, #state{notice_len = Len, reduce_len = RLen}) ->
-    case RefLen < Len of
-        true -> {0, Len - RefLen - 1};
-        false -> {0, Len - RefLen rem RLen - 1}
+do_from_to(Old, New, #state{reduce_len = RLen}) ->
+    case Old < New of
+        true -> {Old, New};
+        false -> {Old rem RLen, New}
     end.
 
 do_form_list(Tables, [Val | T], Acc) ->
     #{<<"op">> := OP, <<"table">> := RedisTable} = jsx:decode(Val, [return_maps]),
     {Table, EtsKey} = do_parse_redis_table(RedisTable),
     case lists:member(Table, Tables) of
-        true -> do_form_list(Tables, T, [{OP, ?ETS_TABLE(Table), EtsKey} | Acc]);
+        true -> do_form_list(Tables, T, [{OP, Table, EtsKey} | Acc]);
         false -> do_form_list(Tables, T, Acc)
     end;
 do_form_list(_Tables, [], Acc) -> Acc.
