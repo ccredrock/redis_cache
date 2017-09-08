@@ -146,7 +146,7 @@ rset_val(Ref, List) ->
     gen_server:call(?MODULE, {rset_val, Ref, List}).
 
 diff_ref(From, From) -> [];
-diff_ref(From, To) when From > 0 andalso To > 0 ->
+diff_ref(From, To) when From >= 0 andalso To >= 0 ->
     gen_server:call(?MODULE, {diff_ref, From, To}).
 
 -spec rput_val(atom(), binary(), any(), any()) -> ok | {'EXIT', any()}.
