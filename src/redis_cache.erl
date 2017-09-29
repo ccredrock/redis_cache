@@ -61,24 +61,15 @@
 
 -define(BIN(V), to_binary(V)).
 
--define(RED_LUA(Max, Red),
-        iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
-                           if Len >= ", ?BIN(Max), " then
-                                local To = Len - math.modf(Len / ", ?BIN(Red), ") * ", ?BIN(Red), "- 1
-                                redis.pcall('LTRIM', '", ?NOTICE, "', 0, To)
-                           end"])).
-
--define(SET_LUA(Len, Exec),
-        iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
-                          if Len == ", ?BIN(Len), " then ",
-                          Exec, " return {'OK', Len}
+-define(SET_LUA(Len, Exec, Nth, Args),
+        [<<"eval">>,
+         iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
+                          if Len == tonumber(KEYS[", integer_to_binary(Nth + 1), "]) then ",
+                           Exec, " return {'OK', Len}
                           else
                             return {'ERROR', Len}
-                          end"])).
-
--define(DIF_LUA(From, To),
-        iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
-                           return redis.pcall('LRANGE', '", ?NOTICE, "', Len - ", ?BIN(To), ", Len - ", ?BIN(From), " - 1)"])).
+                          end"]),
+         Nth + 1 | Args] ++ [?BIN(Len)]).
 
 -record(state, {tables     = [],    %% 所有关心的表
                 notice_len = 0,     %% 当前列表长度
@@ -309,7 +300,7 @@ do_clean_table([Table | T]) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:info(EtsTable) =/= undefined andalso ets:delete_all_objects(EtsTable),
     {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
-    [{ok, _} = eredis_pool:transaction([[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => X})],
+    [{ok, _} = eredis_pool:transaction([[<<"RPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => X})],
                                         [<<"DEL">>, X]]) || X <- List],
     do_clean_table(T);
 do_clean_table([]) -> ok.
@@ -329,12 +320,12 @@ do_set_val(List) ->
 do_set_redis([{put, Table, Key, MKV} | T], Acc) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
     do_set_redis(T, Acc ++
-                 [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})],
+                 [[<<"RPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})],
                   [<<"HMSET">>, RedisTable] ++ lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])]);
 do_set_redis([{del, Table, Key} | T], Acc) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
     do_set_redis(T, Acc ++
-                 [[<<"LPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})],
+                 [[<<"RPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})],
                   [<<"DEL">>, RedisTable]]);
 do_set_redis([], Acc) -> {ok, _} = eredis_pool:transaction(Acc).
 
@@ -373,18 +364,18 @@ do_rset_redis(Ref, [{put, Table, Key, MKV} | T], Nth, Es, As) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
     {Nth1, Keys} = do_form_lua_key(MKV, Nth + 1, []),
     do_rset_redis(Ref, T, Nth1,
-                  Es ++ [["redis.pcall('LPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
+                  Es ++ [["redis.pcall('RPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
                           " redis.pcall('HMSET', '", RedisTable, "'", Keys, ")"]],
                   As ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})
                          | lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])]);
 do_rset_redis(Ref, [{del, Table, Key} | T], Nth, Es, As) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
     do_rset_redis(Ref, T, Nth + 1,
-                  Es ++ ["redis.pcall('LPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
+                  Es ++ ["redis.pcall('RPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
                          " redis.pcall('DEL', '", RedisTable, "')"],
                   As ++ [jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})]);
 do_rset_redis(Ref, [], Nth, Es, As) ->
-    {ok, [<<"OK">>, Len]} = eredis_pool:q([<<"eval">>, ?SET_LUA(Ref, Es), Nth] ++ As), Len.
+    {ok, [<<"OK">>, Len]} = eredis_pool:q(?SET_LUA(Ref, Es, Nth, As)), Len.
 
 do_form_lua_key([_ | T], Nth, Acc) ->
     V = [", KEYS[", integer_to_binary(Nth + 1), "], KEYS[", integer_to_binary(Nth + 2), "]"],
@@ -404,7 +395,7 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, ta
         {ok, NBinLen} ->
             case binary_to_integer(NBinLen) of
                 NLen when NLen >= Max ->                            %% 开始清理 清理队尾1/4
-                    do_reduce_len(Max, RLen), State;
+                    do_reduce_len(NLen, RLen), State;
                 NLen when NLen > Len ->                             %% 增长同步长度
                     do_update_len(Len, NLen, Tables),
                     ets:insert(?ETS, {ref, NLen}),
@@ -421,11 +412,11 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, ta
             State
     end.
 
-do_reduce_len(Max, RLen) ->
-    {ok, _} = eredis_pool:q([<<"eval">>, ?RED_LUA(Max, RLen), 0]).
+do_reduce_len(Len, RLen) ->
+    {ok, _} = eredis_pool:q([<<"LTRIM">>, ?NOTICE, 0, Len rem RLen - 1]).
 
 do_update_len(Len, NLen, Tables) ->
-    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, 0, NLen - Len - 1]),
+    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, Len, NLen - 1]),
     [do_update_key(Val, Tables) || Val  <- lists:usort(List)].
 
 do_update_key(Val, Tables) ->
@@ -454,7 +445,7 @@ do_parse_redis_table(RedisTable) ->
 %%------------------------------------------------------------------------------
 do_diff_ref(Old, New, #state{tables = Tables} = State) ->
     {From, To} = do_from_to(Old, New, State),
-    {ok, List} = eredis_pool:q([<<"eval">>, ?DIF_LUA(From, To), 0]),
+    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, From, To - 1]),
     do_form_list(Tables, List, []).
 
 do_from_to(Old, New, #state{reduce_len = RLen}) ->
