@@ -15,7 +15,7 @@
 
 %%------------------------------------------------------------------------------
 start(_StartType, _StartArgs) ->
-    application:ensure_started(eredis_pool),
+    application:ensure_started(eredis_cluster),
     redis_cache_sup:start_link().
 
 stop(_State) ->

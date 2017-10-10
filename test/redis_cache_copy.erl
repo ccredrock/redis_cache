@@ -55,21 +55,11 @@
 
 -define(ETS, '$redis_cache_copy').
 -define(ETS_TABLE(L), list_to_atom("$redis_cache_copy_kv#" ++ atom_to_list(L))).
--define(REDIS_TABLE(L), iolist_to_binary([<<"$redis_cache_kv#">> | L])).
+-define(REDIS_TABLE(L), iolist_to_binary([<<"${redis_cache}_kv#">> | L])).
 
--define(NOTICE,  <<"$redis_cache_notice">>).
+-define(NOTICE,  <<"${redis_cache}_notice">>).
 
 -define(BIN(V), to_binary(V)).
-
--define(SET_LUA(Len, Exec, Nth, Args),
-        [<<"eval">>,
-         iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
-                          if Len == tonumber(KEYS[", integer_to_binary(Nth + 1), "]) then ",
-                           Exec, " return {'OK', Len}
-                          else
-                            return {'ERROR', Len}
-                          end"]),
-         Nth + 1 | Args] ++ ?BIN(Len)).
 
 -record(state, {tables     = [],    %% 所有关心的表
                 notice_len = 0,     %% 当前列表长度
@@ -170,11 +160,11 @@ clean(List) -> gen_server:call(?MODULE, {clean, List}).
 
 purge() ->
     {ok, Tables} = application:get_env(redis_cache, tables),
-    {ok, _} = eredis_pool:q([<<"DEL">>, ?NOTICE]),
+    {ok, _} = eredis_cluster:q([<<"DEL">>, ?NOTICE]),
     do_clean_table(Tables), ok.
 
 get_redis_notice_len() ->
-    {ok, BLen} = eredis_pool:q([<<"LLEN">>, ?NOTICE]), binary_to_integer(BLen).
+    {ok, BLen} = eredis_cluster:q([<<"LLEN">>, ?NOTICE]), binary_to_integer(BLen).
 
 get_cache_notice_len() ->
     State = sys:get_state(?MODULE), State#state.notice_len.
@@ -183,9 +173,9 @@ get_table_vals(Table) ->
     ets:tab2list(?ETS_TABLE(Table)).
 
 get_redis_vals(Table) ->
-    {ok, KeyList} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
+    {ok, KeyList} = eredis_cluster:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
     [begin
-         {ok, Vals} = eredis_pool:q([<<"HGETALL">>, ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)])]),
+         {ok, Vals} = eredis_cluster:q([<<"HGETALL">>, ?REDIS_TABLE([?BIN(Table), "@", ?BIN(Key)])]),
          {Key, Vals}
      end || Key <- KeyList].
 
@@ -276,11 +266,11 @@ decode(B) ->
 do_load_table(Table) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:new(EtsTable, [named_table, public, {read_concurrency, true}]),
-    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
+    {ok, List} = eredis_cluster:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
     [do_load_table_key(EtsTable, RedisTable) || RedisTable <- List].
 
 do_load_table_key(EtsTable, RedisTable) ->
-    {ok, List} = eredis_pool:q([<<"HGETALL">>, RedisTable]),
+    {ok, List} = eredis_cluster:q([<<"HGETALL">>, RedisTable]),
     {_Table, EtsKey} = do_parse_redis_table(RedisTable),
     ets:insert(EtsTable, {EtsKey, do_form_map(List, maps:new())}).
 
@@ -291,7 +281,7 @@ do_form_map([], Map) -> Map.
 do_reload_table([Table | T]) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:delete_all_objects(EtsTable),
-    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
+    {ok, List} = eredis_cluster:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
     [do_load_table_key(EtsTable, RedisTable) || RedisTable <- List],
     do_reload_table(T);
 do_reload_table([]) -> ok.
@@ -299,15 +289,15 @@ do_reload_table([]) -> ok.
 do_clean_table([Table | T]) ->
     EtsTable = ?ETS_TABLE(Table),
     ets:info(EtsTable) =/= undefined andalso ets:delete_all_objects(EtsTable),
-    {ok, List} = eredis_pool:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
-    [{ok, _} = eredis_pool:transaction([[<<"RPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => X})],
-                                        [<<"DEL">>, X]]) || X <- List],
+    {ok, List} = eredis_cluster:q([<<"KEYS">>, ?REDIS_TABLE([?BIN(Table), "@", <<"*">>])]),
+    [{ok, _} = eredis_cluster:transaction([[<<"RPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => X})],
+                                           [<<"DEL">>, X]]) || X <- List],
     do_clean_table(T);
 do_clean_table([]) -> ok.
 
 do_load_len() ->
     ets:new(?ETS, [named_table, public, {read_concurrency, true}]),
-    {ok, BinLen} = eredis_pool:q([<<"LLEN">>, ?NOTICE]),
+    {ok, BinLen} = eredis_cluster:q([<<"LLEN">>, ?NOTICE]),
     Len = binary_to_integer(BinLen),
     ets:insert_new(?ETS, {ref, Len}), Len.
 
@@ -327,7 +317,7 @@ do_set_redis([{del, Table, Key} | T], Acc) ->
     do_set_redis(T, Acc ++
                  [[<<"RPUSH">>, ?NOTICE, jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})],
                   [<<"DEL">>, RedisTable]]);
-do_set_redis([], Acc) -> {ok, _} = eredis_pool:transaction(Acc).
+do_set_redis([], Acc) -> {ok, _} = eredis_cluster:transaction(Acc).
 
 do_set_ets([{put, Table, Key, MKV} | T]) ->
     EtsTable = ?ETS_TABLE(Table),
@@ -347,7 +337,7 @@ do_get_map(Name, Key, MKV) ->
 %%------------------------------------------------------------------------------
 do_rset_val(State, _Ref, []) -> State;
 do_rset_val(#state{notice_len = Len} = State, Ref, List) ->
-    RedisLen = do_rset_redis(Ref, List, 0, [], []),
+    RedisLen = do_rset_redis(Ref, List, [], 1, [], 1, []),
     do_set_ets(List),
     case binary_to_integer(RedisLen) =:= Len of
         true ->
@@ -358,29 +348,43 @@ do_rset_val(#state{notice_len = Len} = State, Ref, List) ->
             State
     end.
 
-do_rset_redis(Ref, [{put, Table, Key, MKV} | T], Nth, Es, As) ->
-    MKV1 = [[", '", encode(CK), "', '", encode(CV), "' "] || {CK, CV} <- MKV],
-    MKV1 = [[", '", encode(CK), "', '", encode(CV), "' "] || {CK, CV} <- MKV],
+do_rset_redis(Ref, [{put, Table, Key, MKV} | T], Str, KeyNth, Keys, ArgNth, Args) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
-    {Nth1, Keys} = do_form_lua_key(MKV, Nth + 1, []),
-    do_rset_redis(Ref, T, Nth1,
-                  Es ++ [["redis.pcall('RPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
-                          " redis.pcall('HMSET', '", RedisTable, "'", Keys, ")"]],
-                  As ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})
-                         | lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])]);
-do_rset_redis(Ref, [{del, Table, Key} | T], Nth, Es, As) ->
+    {ArgNth1, ArgsStr} = do_form_args(MKV, ArgNth + 1, []),
+    do_rset_redis(Ref, T,
+                  Str ++ ["redis.pcall('HMSET', KEYS[", ?BIN(KeyNth + 1), "]", ArgsStr, ")
+                           redis.pcall('RPUSH', KEYS[1], ARGV[", ?BIN(ArgNth + 1), "])"],
+                  KeyNth + 1,
+                  Keys ++ [RedisTable],
+                  ArgNth1,
+                  Args
+                  ++ lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])
+                  ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})]);
+do_rset_redis(Ref, [{del, Table, Key} | T], Str, KeyNth, Keys, ArgNth, Args) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
-    do_rset_redis(Ref, T, Nth + 1,
-                  Es ++ ["redis.pcall('RPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
-                         " redis.pcall('DEL', '", RedisTable, "')"],
-                  As ++ [jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})]);
-do_rset_redis(Ref, [], Nth, Es, As) ->
-    {ok, [<<"OK">>, Len]} = eredis_pool:q(?SET_LUA(Ref, Es, Nth, As)), Len.
+    do_rset_redis(Ref, T,
+                  Str ++ ["redis.pcall('DEL', KEYS[", ?BIN(KeyNth + 1), "])
+                           redis.pcall('RPUSH', KEYS[1], ARGV[", ?BIN(ArgNth + 1), "])"],
+                  KeyNth + 1,
+                  Keys ++ [RedisTable],
+                  ArgNth + 1,
+                  Args
+                  ++ [jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})]);
+do_rset_redis(Ref, [], Str, KeyNth, Keys, _ArgNth, Args) ->
+    Exec = [<<"eval">>,
+            iolist_to_binary(["local Len = redis.pcall('LLEN', KEYS[1])
+                               if Len == tonumber(ARGV[1]) then
+                                ", Str, "
+                                return {'OK', Len}
+                              else
+                               return {'ERROR', Len}
+                              end"])]
+            ++ [KeyNth, ?NOTICE | Keys] ++ [?BIN(Ref) | Args],
+    {ok, [<<"OK">>, Len]} = eredis_cluster:q(Exec), Len.
 
-do_form_lua_key([_ | T], Nth, Acc) ->
-    V = [", KEYS[", integer_to_binary(Nth + 1), "], KEYS[", integer_to_binary(Nth + 2), "]"],
-    do_form_lua_key(T, Nth + 2, [V | Acc]);
-do_form_lua_key([], Nth, Acc) -> {Nth, Acc}.
+do_form_args([_ | T], Nth, Acc) ->
+    do_form_args(T, Nth + 2, [[", ARGV[", ?BIN(Nth + 1), "], ARGV[", ?BIN(Nth + 2), "]"] | Acc]);
+do_form_args([], Nth, Acc) -> {Nth, lists:reverse(Acc)}.
 
 %%------------------------------------------------------------------------------
 do_timeout(State) ->
@@ -391,7 +395,7 @@ do_timeout(State) ->
 
 %% reduce_max
 do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, tables = Tables} = State) ->
-    case eredis_pool:q([<<"LLEN">>, ?NOTICE]) of
+    case eredis_cluster:q([<<"LLEN">>, ?NOTICE]) of
         {ok, NBinLen} ->
             case binary_to_integer(NBinLen) of
                 NLen when NLen >= Max ->                            %% 开始清理 清理队尾1/4
@@ -413,10 +417,10 @@ do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, ta
     end.
 
 do_reduce_len(Len, RLen) ->
-    {ok, _} = eredis_pool:q([<<"LTRIM">>, ?NOTICE, 0, Len rem RLen - 1]).
+    {ok, _} = eredis_cluster:q([<<"LTRIM">>, ?NOTICE, 0, Len rem RLen - 1]).
 
 do_update_len(Len, NLen, Tables) ->
-    {ok, List} = eredis_pool:q([<<"LRANGE">>, ?NOTICE, Len, NLen - 1]),
+    {ok, List} = eredis_cluster:q([<<"LRANGE">>, ?NOTICE, Len, NLen - 1]),
     [do_update_key(Val, Tables) || Val  <- lists:usort(List)].
 
 do_update_key(Val, Tables) ->
@@ -427,7 +431,7 @@ do_update_key(Val, Tables) ->
             EtsTable = ?ETS_TABLE(Table),
             case OP of
                 <<"put">> ->
-                    {ok, List} = eredis_pool:q([<<"HGETALL">>, RedisTable]),
+                    {ok, List} = eredis_cluster:q([<<"HGETALL">>, RedisTable]),
                     ets:insert(EtsTable, {EtsKey, do_form_map(List, maps:new())});
                 <<"del">> ->
                     ets:delete(EtsTable, EtsKey)
@@ -445,7 +449,7 @@ do_parse_redis_table(RedisTable) ->
 %%------------------------------------------------------------------------------
 do_diff_ref(Old, New, #state{tables = Tables} = State) ->
     {From, To} = do_from_to(Old, New, State),
-    {ok, List} = eredis_pool:q([<<"LRANGE">>, From, To - 1]),
+    {ok, List} = eredis_cluster:q([<<"LRANGE">>, ?NOTICE, From, To - 1]),
     do_form_list(Tables, List, []).
 
 do_from_to(Old, New, #state{reduce_len = RLen}) ->
