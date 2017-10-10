@@ -10,7 +10,7 @@ basic_test_() ->
      {setup, ?Setup, ?Clearnup,
       [{"redis",
          fun() ->
-                 ?assertEqual(ok, element(1, eredis_pool:q([<<"INFO">>])))
+                 ?assertEqual(ok, element(1, hd(eredis_cluster:qa([<<"INFO">>]))))
          end},
       {"put_val",
          fun() ->
