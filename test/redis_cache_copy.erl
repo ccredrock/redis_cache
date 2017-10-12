@@ -61,16 +61,6 @@
 
 -define(BIN(V), to_binary(V)).
 
--define(SET_LUA(Len, Exec, Nth, Args),
-        [<<"eval">>,
-         iolist_to_binary(["local Len = redis.pcall('LLEN', '", ?NOTICE, "')
-                          if Len == tonumber(KEYS[", integer_to_binary(Nth + 1), "]) then ",
-                           Exec, " return {'OK', Len}
-                          else
-                            return {'ERROR', Len}
-                          end"]),
-         Nth + 1 | Args] ++ [?BIN(Len)]).
-
 -record(state, {tables     = [],    %% 所有关心的表
                 notice_len = 0,     %% 当前列表长度
                 reduce_max = 0,     %% 最大列表长度
@@ -347,7 +337,7 @@ do_get_map(Name, Key, MKV) ->
 %%------------------------------------------------------------------------------
 do_rset_val(State, _Ref, []) -> State;
 do_rset_val(#state{notice_len = Len} = State, Ref, List) ->
-    RedisLen = do_rset_redis(Ref, List, 0, [], []),
+    RedisLen = do_rset_redis(Ref, List, [], 1, [], 1, []),
     do_set_ets(List),
     case binary_to_integer(RedisLen) =:= Len of
         true ->
@@ -358,29 +348,43 @@ do_rset_val(#state{notice_len = Len} = State, Ref, List) ->
             State
     end.
 
-do_rset_redis(Ref, [{put, Table, Key, MKV} | T], Nth, Es, As) ->
-    MKV1 = [[", '", encode(CK), "', '", encode(CV), "' "] || {CK, CV} <- MKV],
-    MKV1 = [[", '", encode(CK), "', '", encode(CV), "' "] || {CK, CV} <- MKV],
+do_rset_redis(Ref, [{put, Table, Key, MKV} | T], Str, KeyNth, Keys, ArgNth, Args) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
-    {Nth1, Keys} = do_form_lua_key(MKV, Nth + 1, []),
-    do_rset_redis(Ref, T, Nth1,
-                  Es ++ [["redis.pcall('RPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
-                          " redis.pcall('HMSET', '", RedisTable, "'", Keys, ")"]],
-                  As ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})
-                         | lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])]);
-do_rset_redis(Ref, [{del, Table, Key} | T], Nth, Es, As) ->
+    {ArgNth1, ArgsStr} = do_form_args(MKV, ArgNth + 1, []),
+    do_rset_redis(Ref, T,
+                  Str ++ ["redis.pcall('HMSET', KEYS[", ?BIN(KeyNth + 1), "]", ArgsStr, ")
+                           redis.pcall('RPUSH', KEYS[1], ARGV[", ?BIN(ArgNth + 1), "])"],
+                  KeyNth + 1,
+                  Keys ++ [RedisTable],
+                  ArgNth1,
+                  Args
+                  ++ lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])
+                  ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})]);
+do_rset_redis(Ref, [{del, Table, Key} | T], Str, KeyNth, Keys, ArgNth, Args) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
-    do_rset_redis(Ref, T, Nth + 1,
-                  Es ++ ["redis.pcall('RPUSH', '", ?NOTICE, "', KEYS[", integer_to_binary(Nth + 1), "])"
-                         " redis.pcall('DEL', '", RedisTable, "')"],
-                  As ++ [jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})]);
-do_rset_redis(Ref, [], Nth, Es, As) ->
-    {ok, [<<"OK">>, Len]} = eredis_cluster:q(?SET_LUA(Ref, Es, Nth, As)), Len.
+    do_rset_redis(Ref, T,
+                  Str ++ ["redis.pcall('DEL', KEYS[", ?BIN(KeyNth + 1), "])
+                           redis.pcall('RPUSH', KEYS[1], ARGV[", ?BIN(ArgNth + 1), "])"],
+                  KeyNth + 1,
+                  Keys ++ [RedisTable],
+                  ArgNth + 1,
+                  Args
+                  ++ [jsx:encode(#{<<"op">> => <<"del">>, <<"table">> => RedisTable})]);
+do_rset_redis(Ref, [], Str, KeyNth, Keys, _ArgNth, Args) ->
+    Exec = [<<"eval">>,
+            iolist_to_binary(["local Len = redis.pcall('LLEN', KEYS[1])
+                               if Len == tonumber(ARGV[1]) then
+                                ", Str, "
+                                return {'OK', Len}
+                              else
+                               return {'ERROR', Len}
+                              end"])]
+            ++ [KeyNth, ?NOTICE | Keys] ++ [?BIN(Ref) | Args],
+    {ok, [<<"OK">>, Len]} = eredis_cluster:q(Exec), Len.
 
-do_form_lua_key([_ | T], Nth, Acc) ->
-    V = [", KEYS[", integer_to_binary(Nth + 1), "], KEYS[", integer_to_binary(Nth + 2), "]"],
-    do_form_lua_key(T, Nth + 2, [V | Acc]);
-do_form_lua_key([], Nth, Acc) -> {Nth, Acc}.
+do_form_args([_ | T], Nth, Acc) ->
+    do_form_args(T, Nth + 2, [[", ARGV[", ?BIN(Nth + 1), "], ARGV[", ?BIN(Nth + 2), "]"] | Acc]);
+do_form_args([], Nth, Acc) -> {Nth, lists:reverse(Acc)}.
 
 %%------------------------------------------------------------------------------
 do_timeout(State) ->
