@@ -49,6 +49,8 @@ basic_test_() ->
          end},
        {"reduce",
          fun() ->
+                 application:set_env(redis_cache, alarm_len, 1000),
+                 application:set_env(redis_cache, clean_len, 750),
                  ?assertEqual(ok, redis_cache:purge()),
                  timer:sleep(800),
                  redis_cache:put_val([{test1, X, [{ckey1, cval4}]} || X <- lists:seq(1, 750)]),

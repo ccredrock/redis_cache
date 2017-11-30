@@ -37,6 +37,11 @@
          reload/0,      %% 重新加载
          reload/1]).    %% 重新加载
 
+%% config
+-export([loop_time/0,      %% config: table process loop time
+         alarm_len/0,      %% config: version list alarm len
+         clean_len/0]).    %% config: clean clean len
+
 -export([get_redis_notice_len/0,
          get_cache_notice_len/0,
          get_table_vals/1,
@@ -49,9 +54,9 @@
 %%------------------------------------------------------------------------------
 -behaviour(gen_server).
 
--define(TIMEOUT, 50).
--define(REDUCE_MAX, 10000). %% 队列总长度
--define(REDUCE_LEN(X), (X div 4 * 3)). %% 清理单位长度
+-define(LOOP_TIME,  50).
+-define(ALARM_LEN,  100000).
+-define(CLEAN_LEN,  70000). % error when over 35000/50ms
 
 -define(ETS, '$redis_cache_copy').
 -define(ETS_TABLE(L), list_to_atom("$redis_cache_copy_kv#" ++ atom_to_list(L))).
@@ -62,17 +67,29 @@
 -define(BIN(V), to_binary(V)).
 
 -record(state, {tables     = [],    %% 所有关心的表
-                notice_len = 0,     %% 当前列表长度
-                reduce_max = 0,     %% 最大列表长度
-                check_time = 0,     %% 检查间隔
-                reduce_len = 0}).   %% 清理单位长度
+                notice_len = 0}).   %% 清理单位长度
 
 %%------------------------------------------------------------------------------
 start() ->
-    application:start(?MODULE).
+    application:ensure_all_started(?MODULE).
 
 stop() ->
     application:stop(?MODULE).
+
+%%------------------------------------------------------------------------------
+%% config
+%%------------------------------------------------------------------------------
+-spec loop_time() -> pos_integer().
+loop_time() ->
+    application:get_env(redis_cache, loop_time, ?LOOP_TIME).
+
+-spec alarm_len() -> pos_integer().
+alarm_len() ->
+    application:get_env(redis_cache, alarm_len, ?ALARM_LEN).
+
+-spec clean_len() -> pos_integer().
+clean_len() ->
+    application:get_env(redis_cache, clean_len, ?CLEAN_LEN).
 
 %%------------------------------------------------------------------------------
 -spec start_link([atom()]) -> {ok, pid()} | ignore | {error, any()}.
@@ -181,14 +198,9 @@ get_redis_vals(Table) ->
 
 %%------------------------------------------------------------------------------
 init([Tables]) ->
-    Max = application:get_env(redis_cache, reduce_max, ?REDUCE_MAX),
-    Time = application:get_env(redis_cache, check_time, ?TIMEOUT),
     Len = do_load_len(),
     [do_load_table(Table) || Table <- Tables],
-    {ok, #state{tables = Tables, notice_len = Len,
-                reduce_max = Max,
-                check_time = Time,
-                reduce_len = ?REDUCE_LEN(Max)}, 0}.
+    {ok, #state{tables = Tables, notice_len = Len}, 0}.
 
 handle_call({set_val, List}, _, State) ->
     {reply, catch do_set_val(List), State};
@@ -206,7 +218,7 @@ handle_call({clean, ['$all']}, _From, State) ->
 handle_call({clean, List}, _From, State) ->
     {reply, catch do_clean_table(List), State};
 handle_call({diff_ref, Old, New}, _, State) ->
-    {reply, do_diff_ref(Old, New, State), State};
+    {reply, catch do_diff_ref(Old, New, State), State};
 handle_call(_Call, _From, State) ->
     {reply, ok, State}.
 
@@ -220,7 +232,7 @@ terminate(_Reason, _State) ->
 
 handle_info(timeout, State) ->
     State1 = do_timeout(State),
-    erlang:send_after(State#state.check_time, self(), timeout),
+    erlang:send_after(loop_time(), self(), timeout),
     {noreply, State1};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -350,13 +362,13 @@ do_rset_val(#state{notice_len = Len} = State, Ref, List) ->
 
 do_rset_redis(Ref, [{put, Table, Key, MKV} | T], Str, KeyNth, Keys, ArgNth, Args) ->
     RedisTable = ?REDIS_TABLE([?BIN(Table), "@", get_type(Key), "&", ?BIN(Key)]),
-    {ArgNth1, ArgsStr} = do_form_args(MKV, ArgNth + 1, []),
+    {ArgNth1, ArgsStr} = do_form_args(MKV, ArgNth, []),
     do_rset_redis(Ref, T,
                   Str ++ ["redis.pcall('HMSET', KEYS[", ?BIN(KeyNth + 1), "]", ArgsStr, ")
-                           redis.pcall('RPUSH', KEYS[1], ARGV[", ?BIN(ArgNth + 1), "])"],
+                           redis.pcall('RPUSH', KEYS[1], ARGV[", ?BIN(ArgNth1 + 1), "])"],
                   KeyNth + 1,
                   Keys ++ [RedisTable],
-                  ArgNth1,
+                  ArgNth1 + 1,
                   Args
                   ++ lists:flatten([[encode(CK), encode(CV)] || {CK, CV} <- MKV])
                   ++ [jsx:encode(#{<<"op">> => <<"put">>, <<"table">> => RedisTable})]);
@@ -394,30 +406,35 @@ do_timeout(State) ->
     end.
 
 %% reduce_max
-do_check_update(#state{notice_len = Len, reduce_max = Max, reduce_len = RLen, tables = Tables} = State) ->
-    case eredis_cluster:q([<<"LLEN">>, ?NOTICE]) of
-        {ok, NBinLen} ->
-            case binary_to_integer(NBinLen) of
-                NLen when NLen >= Max ->                            %% 开始清理 清理队尾1/4
-                    do_reduce_len(NLen, RLen), State;
-                NLen when NLen > Len ->                             %% 增长同步长度
-                    do_update_len(Len, NLen, Tables),
-                    ets:insert(?ETS, {ref, NLen}),
-                    State#state{notice_len = NLen};
-                NLen when NLen < Len andalso NLen > Len rem RLen -> %% 清理后增长同步
-                    do_update_len(Len rem RLen, NLen, Tables),
-                    ets:insert(?ETS, {ref, NLen}),
-                    State#state{notice_len = NLen};
-                NLen ->                                             %% 清理后未增长同步
-                    ets:insert(?ETS, {ref, NLen}),
-                    State#state{notice_len = NLen}
-            end;
-        _ ->
-            State
+do_check_update(#state{notice_len = Len, tables = Tables} = State) ->
+    AlarmLen = alarm_len(),
+    {ok, NBinLen} = eredis_cluster:q([<<"LLEN">>, ?NOTICE]),
+    case binary_to_integer(NBinLen) of
+        Len ->
+            State;
+        NLen when NLen >= AlarmLen ->
+            do_reduce_len(AlarmLen), State;
+        NLen when NLen > Len ->
+            do_update_len(Len, NLen, Tables),
+            ets:insert(?ETS, {ref, NLen}),
+            State#state{notice_len = NLen};
+        NLen ->
+            do_update_len(Len - AlarmLen, NLen, Tables),
+            ets:insert(?ETS, {ref, NLen}),
+            State#state{notice_len = NLen}
     end.
 
-do_reduce_len(Len, RLen) ->
-    {ok, _} = eredis_cluster:q([<<"LTRIM">>, ?NOTICE, 0, Len rem RLen - 1]).
+do_reduce_len(AlarmLen) ->
+    CleanLen = clean_len(),
+    EvalStr = ["local Len = redis.pcall('LLEN', KEYS[1])
+                if Len >= tonumber(ARGV[1]) then
+                    local LeftLen = Len - tonumber(ARGV[2])
+                    redis.pcall('LTRIM', KEYS[1], 0 - LeftLen,  -1)
+                    return {Len, LeftLen}
+                else
+                    return Len
+                end"],
+    {ok, _} = eredis_cluster:q([<<"eval">>, iolist_to_binary(EvalStr), 1, ?NOTICE, AlarmLen, CleanLen]).
 
 do_update_len(Len, NLen, Tables) ->
     {ok, List} = eredis_cluster:q([<<"LRANGE">>, ?NOTICE, Len, NLen - 1]),
@@ -447,15 +464,16 @@ do_parse_redis_table(RedisTable) ->
     {put_type(Table, atom), put_type(BinEtsKey, Type)}.
 
 %%------------------------------------------------------------------------------
-do_diff_ref(Old, New, #state{tables = Tables} = State) ->
-    {From, To} = do_from_to(Old, New, State),
+do_diff_ref(Old, New, #state{tables = Tables}) ->
+    {From, To} = do_from_to(Old, New),
     {ok, List} = eredis_cluster:q([<<"LRANGE">>, ?NOTICE, From, To - 1]),
     do_form_list(Tables, List, []).
 
-do_from_to(Old, New, #state{reduce_len = RLen}) ->
-    case Old < New of
+do_from_to(Old, New) ->
+    CleanLen = clean_len(),
+    case Old =< New of
         true -> {Old, New};
-        false -> {Old rem RLen, New}
+        false -> {Old - CleanLen, New}
     end.
 
 do_form_list(Tables, [Val | T], Acc) ->

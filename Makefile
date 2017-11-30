@@ -1,14 +1,16 @@
 ERL=erl
-BEAMDIR=./deps/*/ebin ./ebin
 REBAR=./rebar
+BEAMDIR=./deps/*/ebin ./ebin
 
-all: clean get-deps update-deps compile xref
+.PHONY: deps doc test
+all: clean deps compile xref
 
-update-deps:
-	@$(REBAR) update-deps
+clean:
+	@$(REBAR) clean
 
-get-deps:
+deps:
 	@$(REBAR) get-deps
+	@$(REBAR) update-deps
 
 compile:
 	@$(REBAR) compile
@@ -16,15 +18,14 @@ compile:
 xref:
 	@$(REBAR) xref skip_deps=true
 
-clean: 
-	@ $(REBAR) clean
+doc:
+	@$(REBAR) skip_deps=true doc
 
-eunit:
+test:
 	@rm -rf .eunit
 	@mkdir -p .eunit
-	@ERL_FLAGS="-config test.config" $(REBAR) skip_deps=true eunit 
+	@ERL_FLAGS="-config test.config" $(REBAR) skip_deps=true eunit
 
-test: eunit
+run:
+	@$(ERL) -pa ebin -pa deps/*/ebin -config test.config -s redis_sync start
 
-edoc:
-	@$(REBAR) skip_deps=true doc

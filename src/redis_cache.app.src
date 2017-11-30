@@ -1,7 +1,7 @@
 {application, redis_cache,
  [
   {description, ""},
-  {vsn, "2.0"},
+  {vsn, "2.1"},
   {registered, []},
   {applications, [
                   kernel,
